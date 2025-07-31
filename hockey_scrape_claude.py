@@ -11,7 +11,7 @@ class NHLAPIClient:
     def __init__(self, base_delay: float = 0.5):
         """
         Initialize NHL API client
-        
+
         Args:
             base_delay: Delay between requests in seconds
         """
@@ -19,22 +19,23 @@ class NHLAPIClient:
         self.new_api_base = "https://api-web.nhle.com"
         self.stats_api_base = "https://api.nhle.com/stats/rest"
         
+
         # Legacy NHL API (still works for some endpoints)
         self.legacy_api_base = "https://statsapi.web.nhl.com/api/v1"
-        
+
         self.session = requests.Session()
         self.base_delay = base_delay
-        
+
         # Setup logging
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
-        
+
         # Set headers
         self.session.headers.update({
             'User-Agent': 'NHL-Stats-Collector/1.0',
             'Accept': 'application/json'
         })
-    
+
     def _make_request(self, url: str, params: Optional[Dict] = None) -> Optional[Dict]:
         """
         Make API request with error handling and rate limiting
@@ -50,37 +51,38 @@ class NHLAPIClient:
         except json.JSONDecodeError as e:
             self.logger.error(f"JSON decode error for {url}: {e}")
             return None
-    
+
     def get_teams(self) -> pd.DataFrame:
         """
         Get all NHL teams
         """
-        url = f"{self.new_api_base}/v1/teams"
+        url = f"{self.stats_api_base}/en/team"
         data = self._make_request(url)
-        
-        if not data:
+
+        if not data or 'data' not in data:
             return pd.DataFrame()
-        
+
         teams = []
-        for team in data:
+        for team in data['data']:
             teams.append({
                 'team_id': team.get('id'),
-                'team_name': team.get('name'),
-                'team_abbrev': team.get('abbrev'),
-                'team_common_name': team.get('commonName'),
-                'team_location': team.get('locationName'),
-                'division': team.get('division'),
-                'conference': team.get('conference')
+                'team_abbrev': team.get('triCode'),
+                'team_name': team.get('fullName'),
+                'franchise_id': team.get('franchiseId'),
+                'league_id': team.get('league'),
             })
-        
+
         df = pd.DataFrame(teams)
+        # Ensure team_id is an integer
+        if not df.empty:
+            df['franchise_id'] = df['franchise_id'].astype('Int64')
         self.logger.info(f"Retrieved {len(df)} teams")
         return df
-    
+
     def get_team_stats(self, season: str) -> pd.DataFrame:
         """
         Get team statistics for a season
-        
+
         Args:
             season: Season in format "20232024" (2023-24 season)
         """
@@ -89,11 +91,11 @@ class NHLAPIClient:
             'season': season,
             'gameType': 2  # Regular season (2), Playoffs (3)
         }
-        
+
         data = self._make_request(url, params)
         if not data or 'data' not in data:
             return pd.DataFrame()
-        
+
         teams_data = []
         for team in data['data']:
             teams_data.append({
@@ -115,34 +117,36 @@ class NHLAPIClient:
                 'shots_against_per_game': team.get('shotsAgainstPerGame'),
                 'face_off_win_pct': team.get('faceoffWinPct')
             })
-        
+
         df = pd.DataFrame(teams_data)
         self.logger.info(f"Retrieved team stats for {len(df)} teams in season {season}")
         return df
-    
+
     def get_player_stats(self, season: str, player_type: str = 'skaters') -> pd.DataFrame:
         """
         Get player statistics for a season
-        
+
         Args:
             season: Season in format "20232024"
             player_type: 'skaters' or 'goalies'
         """
         if player_type == 'skaters':
             url = f"{self.stats_api_base}/en/skater/summary"
+            # url = f"{self.stats_api_base}/en/skater/summary?limit=72&start=17&sort=points&cayenneExp=seasonId=20232024"
         else:
             url = f"{self.stats_api_base}/en/goalie/summary"
-        
+
         params = {
-            'season': season,
+            'limit': 1000,  # Get up to 1000 players
+            'cayenneExp': '',
+            'seasonId': season,
             'gameType': 2,  # Regular season
-            'limit': 1000  # Get up to 1000 players
         }
-        
+
         data = self._make_request(url, params)
         if not data or 'data' not in data:
             return pd.DataFrame()
-        
+
         players_data = []
         for player in data['data']:
             if player_type == 'skaters':
@@ -193,32 +197,27 @@ class NHLAPIClient:
                     'points': player.get('points'),
                     'penalty_minutes': player.get('penaltyMinutes')
                 })
-        
+
         df = pd.DataFrame(players_data)
         self.logger.info(f"Retrieved {player_type} stats for {len(df)} players in season {season}")
         return df
-    
-    def get_game_results(self, season: str, team_id: Optional[int] = None) -> pd.DataFrame:
+
+    def get_game_results(self, season: str, team_abbrev: str) -> pd.DataFrame:
         """
-        Get game results for a season
-        
+        Get game results for a season for a specific team
+
         Args:
             season: Season in format "20232024"
-            team_id: Optional team ID to filter by specific team
+            team_abbrev: Team abbreviation (e.g., "BOS", "TOR")
         """
-        # Get schedule first
-        url = f"{self.new_api_base}/v1/schedule/{season}"
-        
+        url = f"{self.new_api_base}/v1/club-schedule-season/{team_abbrev}/{season}"
         data = self._make_request(url)
         if not data or 'weeks' not in data:
             return pd.DataFrame()
-        
+
         games_data = []
         for week in data['weeks']:
             for game in week.get('games', []):
-                if team_id and game.get('homeTeam', {}).get('id') != team_id and game.get('awayTeam', {}).get('id') != team_id:
-                    continue
-                
                 games_data.append({
                     'season': season,
                     'game_id': game.get('id'),
@@ -233,24 +232,43 @@ class NHLAPIClient:
                     'away_score': game.get('awayTeam', {}).get('score'),
                     'venue': game.get('venue', {}).get('default')
                 })
-        
+
         df = pd.DataFrame(games_data)
-        self.logger.info(f"Retrieved {len(df)} games for season {season}")
+        self.logger.info(f"Retrieved {len(df)} games for team {team_abbrev} in season {season}")
         return df
-    
+
+    def _get_standings_final_date(self, season: str) -> Optional[str]:
+        """
+        Fetch the final standings date for a given season from the standings-season endpoint.
+        """
+        url = f"{self.new_api_base}/v1/standings-season"
+        data = self._make_request(url)
+        if not data or 'seasons' not in data:
+            self.logger.warning(f"Could not fetch standings-season data for season {season}")
+            return None
+        for entry in data['seasons']:  
+            if str(entry.get('id')) == str(season):
+                return entry.get('standingsStart')
+        self.logger.warning(f"No standings date found for season {season}")
+        return None
+
     def get_standings(self, season: str) -> pd.DataFrame:
         """
         Get standings for a season
-        
+
         Args:
             season: Season in format "20232024"
         """
-        url = f"{self.new_api_base}/v1/standings/{season}"
-        
+        standings_date = self._get_standings_final_date(season)
+        if not standings_date:
+            return pd.DataFrame()
+        # url = f"{self.new_api_base}/v1/standings/{season}"
+        url = f"{self.new_api_base}/v1/standings/{standings_date}"
+
         data = self._make_request(url)
         if not data or 'standings' not in data:
             return pd.DataFrame()
-        
+
         standings_data = []
         for standing in data['standings']:
             standings_data.append({
@@ -281,19 +299,19 @@ class NHLAPIClient:
                 'streak_code': standing.get('streakCode'),
                 'streak_count': standing.get('streakCount')
             })
-        
+
         df = pd.DataFrame(standings_data)
         self.logger.info(f"Retrieved standings for {len(df)} teams in season {season}")
         return df
-    
+
     def get_multiple_seasons_data(self, seasons: List[str], include_games: bool = False) -> Dict[str, pd.DataFrame]:
         """
         Get comprehensive data for multiple seasons
-        
+
         Args:
             seasons: List of seasons in format ["20222023", "20232024"]
             include_games: Whether to include game-by-game data (can be large)
-        
+
         Returns:
             Dictionary with DataFrames for different data types
         """
@@ -304,41 +322,50 @@ class NHLAPIClient:
             'goalie_stats': [],
             'standings': []
         }
-        
+
         if include_games:
             results['games'] = []
-        
+
         # Get teams once (they don't change much)
+        self.logger.info(f"Fetching team data")
         results['teams'] = self.get_teams()
-        
+
         for season in seasons:
             self.logger.info(f"Downloading data for season {season}")
-            
+
             # Team stats
             team_stats = self.get_team_stats(season)
             if not team_stats.empty:
                 results['team_stats'].append(team_stats)
-            
+
             # Player stats
             skater_stats = self.get_player_stats(season, 'skaters')
             if not skater_stats.empty:
                 results['skater_stats'].append(skater_stats)
-            
+
             goalie_stats = self.get_player_stats(season, 'goalies')
             if not goalie_stats.empty:
                 results['goalie_stats'].append(goalie_stats)
-            
+
             # Standings
             standings = self.get_standings(season)
             if not standings.empty:
                 results['standings'].append(standings)
-            
+
             # Games (optional)
             if include_games:
-                games = self.get_game_results(season)
-                if not games.empty:
-                    results['games'].append(games)
-        
+                all_team_abbrevs = results['teams']['team_abbrev'].dropna().unique().tolist()
+                games_list = []
+                for team_abbrev in all_team_abbrevs:
+                    games = self.get_game_results(season, team_abbrev)
+                    if not games.empty:
+                        games_list.append(games)
+                if games_list:
+                    # Concatenate and drop duplicates by game_id
+                    all_games = pd.concat(games_list, ignore_index=True)
+                    all_games = all_games.drop_duplicates(subset=['game_id'])
+                    results['games'].append(all_games)
+
         # Combine seasons
         final_results = {}
         for key, data_list in results.items():
@@ -348,19 +375,19 @@ class NHLAPIClient:
                 final_results[key] = pd.concat(data_list, ignore_index=True)
             else:
                 final_results[key] = pd.DataFrame()
-        
+
         return final_results
-    
+
     def save_data_to_files(self, data: Dict[str, pd.DataFrame], output_dir: str = "nhl_data"):
         """
         Save data to CSV files
-        
+
         Args:
             data: Dictionary of DataFrames
             output_dir: Directory to save files
         """
         os.makedirs(output_dir, exist_ok=True)
-        
+
         for data_type, df in data.items():
             if not df.empty:
                 filename = os.path.join(output_dir, f"nhl_{data_type}.csv")
@@ -373,19 +400,19 @@ class NHLAPIClient:
 if __name__ == "__main__":
     # Initialize client
     client = NHLAPIClient(base_delay=0.5)
-    
+
     # Define seasons to download (format: start_year + end_year)
     seasons = ["20222023", "20232024"]  # 2022-23 and 2023-24 seasons
-    
+
     print("=== NHL API Data Downloader ===")
     print(f"Downloading data for seasons: {seasons}")
-    
+
     # Download comprehensive data
     data = client.get_multiple_seasons_data(
         seasons=seasons,
         include_games=True  # Set to False if you don't need game-by-game data
     )
-    
+
     # Print summary
     print("\n=== Data Summary ===")
     for data_type, df in data.items():
@@ -395,10 +422,10 @@ if __name__ == "__main__":
                 print(f"  Columns: {list(df.columns)[:10]}...")  # First 10 columns
         else:
             print(f"{data_type}: No data")
-    
+
     # Save to files
     client.save_data_to_files(data)
-    
+
     print("\n=== Sample Data ===")
     # Show sample of each dataset
     for data_type, df in data.items():
