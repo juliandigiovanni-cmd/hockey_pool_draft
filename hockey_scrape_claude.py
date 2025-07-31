@@ -137,7 +137,7 @@ class NHLAPIClient:
             url = f"{self.stats_api_base}/en/goalie/summary"
 
         params = {
-            'limit': 1000,  # Get up to 1000 players
+            'limit': 2000,  # Get up to 1000 players
             'cayenneExp': '',
             'seasonId': season,
             'gameType': 2,  # Regular season
