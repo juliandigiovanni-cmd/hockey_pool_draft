@@ -1,2 +1,28 @@
-nhl_team_stats.csv
-nhl_data
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Per-season generated data/artifacts (code + config are tracked, outputs are not)
+20*-*/data/*
+20*-*/models/*
+20*-*/results/*
+20*-*/plots/*
+!20*-*/data/.gitkeep
+!20*-*/models/.gitkeep
+!20*-*/results/.gitkeep
+!20*-*/plots/.gitkeep
+
+# Legacy 2025-26 folder: keep code, ignore its bulky generated output
+2025-26/nhl_data_*/
+2025-26/data_output/
+2025-26/nhl_plots/
+2025-26/nhl_results/
+2025-26/previous_versions/nhl_data*/
+2025-26/previous_versions/nhl_output/
+2025-26/pool_output/
+2025-26/pool_plots/

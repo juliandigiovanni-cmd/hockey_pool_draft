@@ -1,0 +1,48 @@
+# Season configuration for the 2026-27 hockey pool draft.
+# Copy this file to a new season folder each year and update the fields below —
+# that plus running run_season.py is the entire annual re-run process.
+
+season: "2026-27"
+season_id: "20262027"          # NHL API season id format (YYYYYYYY)
+history_start_year: 2008        # first season year included in the historical training set
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  models_dir: models
+  results_dir: results
+  plots_dir: plots
+
+# Snapshot date used to pull each player's *current* team (trades/free agency/waivers)
+# so predictions use this season's team context, not last season's. Update this closer
+# to draft day so it reflects the latest roster moves.
+roster_as_of_date: "2026-07-23"
+
+# Manual fallback only — used if a player can't be resolved from the roster snapshot
+# (e.g. a source outage). Leave empty in normal operation.
+trade_overrides: []
+# example:
+# trade_overrides:
+#   - player: "Mitch Marner"
+#     team: "VGK"
+
+lag_years: 2
+min_training_year: null
+
+validation:
+  exclude_latest_season_for_oos: true
+
+scoring:
+  forwards:
+    goals: 1
+    assists: 1
+  defense:
+    goals: 1
+    assists: 1
+    plus_minus: 1
+  goalies:
+    win: 1
+    shutout_win: 3       # total for a shutout win (not additive on top of the win point)
+    min_gp_for_bonus: 40
+    best_gaa_bonus: 10
+    best_save_pct_bonus: 10
