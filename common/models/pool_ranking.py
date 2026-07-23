@@ -9,7 +9,8 @@ with common.scrape.rosters.apply_current_team_overrides (live roster snapshot + 
 
 Flow: load processed skater/goalie data -> train (5-algo select) + OOS-validate each target ->
 build next-season prediction rows by appending placeholder rows and reusing the exact feature
-pipeline -> apply current-team overrides -> project games (forwards/defense 82, goalies 3-yr avg)
+pipeline -> apply current-team overrides -> project games (forwards/defense cfg.games_per_season,
+goalies 3-yr avg capped at cfg.games_per_season)
 -> score pool_points per cfg.scoring -> write rankings + report to results_dir and plots to plots_dir.
 """
 
@@ -101,13 +102,13 @@ def _predict_rows(engineer_fn, aug_raw: pd.DataFrame, cfg: SeasonConfig) -> pd.D
     return apply_current_team_overrides(rows, cfg)
 
 
-def _goalie_projected_games(goalie_raw: pd.DataFrame, default: int = 20) -> dict:
+def _goalie_projected_games(goalie_raw: pd.DataFrame, games_per_season: int, default: int = 20) -> dict:
     df = fe.add_year(goalie_raw)
     out = {}
     for pid, g in df.sort_values("year").groupby("player_id"):
         gp = pd.to_numeric(g["games_played_player"], errors="coerce").dropna().tail(3)
         gp = gp[gp > 0]
-        out[pid] = min(gp.mean(), 82) if len(gp) else default
+        out[pid] = min(gp.mean(), games_per_season) if len(gp) else default
     return out
 
 
@@ -232,17 +233,17 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
     # Forwards
     fwd_rows = _predict_rows(fwd.engineer, skater_aug, cfg)
     fwd_rows["pred_points_per_game"] = models["forward_points"].predict(fwd_rows)
-    fwd_rows["projected_games"] = 82
+    fwd_rows["projected_games"] = cfg.games_per_season
 
     # Defense
     def_rows = _predict_rows(dfe.engineer, skater_aug, cfg)
     def_rows["pred_points_per_game"] = models["defense_points"].predict(def_rows)
     def_rows["pred_plus_minus_per_game"] = models["defense_plus_minus"].predict(def_rows)
-    def_rows["projected_games"] = 82
+    def_rows["projected_games"] = cfg.games_per_season
 
     # Goalies
     goal_rows = _predict_rows(goa.engineer, goalie_aug, cfg)
-    gp_map = _goalie_projected_games(goalie)
+    gp_map = _goalie_projected_games(goalie, cfg.games_per_season)
     goal_rows["projected_games"] = goal_rows["player_id"].map(gp_map).fillna(20)
     for target, col in [("wins", "pred_wins_per_game"), ("shutouts", "pred_shutouts_per_game"),
                         ("gaa", "pred_gaa"), ("save_pct", "pred_save_pct")]:

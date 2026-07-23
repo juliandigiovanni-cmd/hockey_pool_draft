@@ -16,6 +16,7 @@ class SeasonConfig:
     season: str
     season_id: str
     history_start_year: int
+    games_per_season: int
     season_dir: Path
     raw_dir: Path
     processed_dir: Path
@@ -48,6 +49,7 @@ def load_season_config(season: str) -> SeasonConfig:
         season=raw["season"],
         season_id=raw["season_id"],
         history_start_year=raw["history_start_year"],
+        games_per_season=raw.get("games_per_season", 82),
         season_dir=season_dir,
         raw_dir=season_dir / paths["raw_dir"],
         processed_dir=season_dir / paths["processed_dir"],

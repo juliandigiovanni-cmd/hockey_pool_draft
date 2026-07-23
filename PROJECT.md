@@ -137,6 +137,17 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
     rows, includes the just-completed 2025-26 season), train (~1 min), predict (~2s, reused
     models). Real 2026-27 rankings: McDavid #1, Draisaitl #2, MacKinnon #3, Kucherov #4,
     Celebrini #5 — hockey-plausible, and reflects real current data.
+- **NHL regular season expanded from 82 to 84 games, effective 2026-27**: added a
+  `games_per_season` field to `SeasonConfig`/`config.yaml` (default 82 for back-compat with
+  seasons that don't set it) instead of hardcoding the game count. `2026-27/config.yaml` sets
+  it to 84. `common/models/pool_ranking.py` now uses `cfg.games_per_season` for forward/defense
+  projected games and as the cap on the goalie 3-year rolling-average games projection, so
+  future game-count changes are a one-line config edit, not a code change. Left the `82` fallback
+  in `common/features/engineering.py` (`add_team_goal_differential`) alone — it's a missing-data
+  default for historical (genuinely 82-game) seasons' team-level games-played, and doesn't affect
+  the 2026-27 prediction row since that row's goal columns are NaN -> 0 regardless of denominator.
+  Re-ran `--stage predict` (reusing persisted models, no retrain needed) to refresh
+  `2026-27/results/` with 84-game projections.
 
 ## Future milestones (not in scope for the 2026-27 rebuild)
 

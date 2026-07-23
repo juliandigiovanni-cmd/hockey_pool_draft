@@ -5,6 +5,7 @@
 season: "2026-27"
 season_id: "20262027"          # NHL API season id format (YYYYYYYY)
 history_start_year: 2008        # first season year included in the historical training set
+games_per_season: 84             # NHL regular season expanded from 82 to 84 games starting 2026-27
 
 paths:
   raw_dir: data/raw
