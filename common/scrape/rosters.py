@@ -13,7 +13,7 @@ import logging
 import pandas as pd
 
 from common.config import SeasonConfig
-from common.scrape.nhl_api import NHLAPIClient, WEB_API_BASE
+from common.scrape.nhl_api import NHLAPIClient, RAW_FILES, WEB_API_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +42,33 @@ def get_current_roster(client: NHLAPIClient, team_abbrev: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def update_current_rosters(cfg: SeasonConfig, client: NHLAPIClient | None = None) -> pd.DataFrame:
-    """Fetch and save every team's current roster as this season's team-assignment source."""
-    client = client or NHLAPIClient()
-    teams_path = cfg.raw_dir / "nhl_teams.csv"
-    if not teams_path.exists():
-        raise FileNotFoundError(f"Run the scrape stage first — no teams file at {teams_path}")
-    teams_df = pd.read_csv(teams_path)
+def _active_team_abbrevs(cfg: SeasonConfig) -> list[str]:
+    """Teams that played in the most recently completed season = teams that exist now.
 
+    nhl_teams.csv is the full all-time franchise list (every code the NHL API has ever
+    returned, including defunct/relocated ones like QUE/ATL/HFD) — fetching a "current
+    roster" for those always 404s, so restrict to teams present in the latest season of
+    nhl_team_stats.csv instead.
+    """
+    teams_path = cfg.raw_dir / RAW_FILES["teams"]
+    team_stats_path = cfg.raw_dir / RAW_FILES["team_stats"]
+    if not teams_path.exists() or not team_stats_path.exists():
+        raise FileNotFoundError(f"Run the scrape stage first — missing {teams_path} or {team_stats_path}")
+
+    teams_df = pd.read_csv(teams_path)
+    team_stats = pd.read_csv(team_stats_path, dtype={"season": str})
+    latest_season = team_stats["season"].max()
+    active_ids = team_stats.loc[team_stats["season"] == latest_season, "team_id"].unique()
+    return teams_df.loc[teams_df["team_id"].isin(active_ids), "team_abbrev"].dropna().unique().tolist()
+
+
+def update_current_rosters(cfg: SeasonConfig, client: NHLAPIClient | None = None) -> pd.DataFrame:
+    """Fetch and save each currently-active team's current roster as this season's
+    team-assignment source."""
+    client = client or NHLAPIClient()
     rosters = [
         get_current_roster(client, abbrev)
-        for abbrev in teams_df["team_abbrev"].dropna().unique()
+        for abbrev in _active_team_abbrevs(cfg)
     ]
     rosters_df = pd.concat([r for r in rosters if not r.empty], ignore_index=True)
 

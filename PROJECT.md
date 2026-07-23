@@ -70,11 +70,14 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
   recent season only — a full historical backfill would mean one API call per player per
   season across 2008-2025 for marginal benefit over the existing season-level lag features)
   for rolling-form features, and current-team rosters (see `rosters.py` above).
-- **MoneyPuck** (`common/scrape/sources/moneypuck.py`) — added. Free CSV downloads, no
-  signup/approval needed, adds xGoals/shot-quality/goalie GSAx features the NHL API doesn't
-  have. *Not yet verified with a live fetch* — this session's sandbox network couldn't reach
-  moneypuck.com (connection reset, likely Cloudflare bot protection on the sandbox IP);
-  confirm the CSV URLs still resolve on a real run of the scrape stage.
+- **MoneyPuck** (`common/scrape/sources/moneypuck.py`) — added, but **unreachable in practice
+  so far** (2026-07-23): every request gets an immediate `Connection reset by peer`, both from
+  the dev sandbox and from the user's real machine. Tried switching from bare `pd.read_csv(url)`
+  to `requests` with a browser-like User-Agent (a classic Cloudflare bot-check fix) — made no
+  difference, so this looks like a network-level block (firewall/ASN/IP), not a bot-UA check.
+  The scrape stage degrades gracefully when this happens (logs a warning, skips MoneyPuck,
+  continues to clean/train/predict) rather than failing the run. Revisit if/when reachable from
+  a different network, or drop it in favor of Natural Stat Trick if it stays blocked.
 - **Natural Stat Trick** — skipped for now. Free, but requires requesting a manually-approved
   access key before automated pulls work, and its stats mostly overlap MoneyPuck's. Revisit
   only if MoneyPuck's feature set proves insufficient.
@@ -110,6 +113,30 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
   goalies, not a well-fit regression).
 - Test artifacts from that verification (copied-in raw CSVs, trained models, results, plots)
   were removed afterward — `2026-27/` is clean and ready for a real `--stage all` run.
+- **First real `--stage all` run (2026-07-23) found and fixed three bugs**:
+  1. **Crash**: `update_moneypuck_data()` raised `ValueError: No objects to concatenate` when
+     every year's fetch failed for an entity (which happens every run right now — see MoneyPuck
+     note above) — took down `clean`/`train`/`predict` with it. Fixed: guard against zero
+     successful fetches, log a warning, skip that entity. Also wrapped the roster/game-log/
+     MoneyPuck scrape steps in `common/pipeline.py` with a best-effort try/except, since none of
+     them are required by `clean_and_merge` — one enhancement source being down should never
+     block the required NHL stats -> clean -> train -> predict path.
+  2. **Redundant re-download**: `update_raw_data()`/`update_moneypuck_data()` only skipped
+     seasons/years already present in *that season's own* `raw_dir` — since every new season
+     folder starts empty, each year's first scrape re-fetched the entire 2008-present history
+     from scratch (~150-200+ NHL API requests) before reaching the one actually-new season.
+     Fixed: `nhl_api.seed_from_prior_season()` / `moneypuck._seed_from_prior_season()` now copy
+     the previous season's raw CSVs forward on first run, so only the newly-completed season
+     needs fetching. Chains automatically from 2027-28 onward.
+  3. **Roster fetch noise**: `update_current_rosters()` looped over all 62 all-time franchise
+     codes from `nhl_teams.csv` (including 29 defunct/relocated ones like QUE/ATL/HFD), each
+     good for a guaranteed 404. Fixed: derive the active-team list from the most recent season
+     in `nhl_team_stats.csv` instead — the roster data itself was always fine (800/800 players
+     across the real 32 teams), this only cut the noise/wasted requests.
+  - Re-ran end-to-end after fixes: scrape (skips cached history correctly), clean (16,273 skater
+    rows, includes the just-completed 2025-26 season), train (~1 min), predict (~2s, reused
+    models). Real 2026-27 rankings: McDavid #1, Draisaitl #2, MacKinnon #3, Kucherov #4,
+    Celebrini #5 — hockey-plausible, and reflects real current data.
 
 ## Future milestones (not in scope for the 2026-27 rebuild)
 

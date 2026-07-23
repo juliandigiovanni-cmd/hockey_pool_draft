@@ -10,6 +10,8 @@ missing from the existing raw CSVs.
 from __future__ import annotations
 
 import logging
+import re
+import shutil
 import time
 from pathlib import Path
 
@@ -263,6 +265,37 @@ def _existing_seasons(path: Path) -> set[str]:
     return set(df["season"].unique())
 
 
+def _prior_season_name(season: str) -> str | None:
+    """'2026-27' -> '2025-26'."""
+    m = re.match(r"^(\d{4})-(\d{2})$", season)
+    if not m:
+        return None
+    start = int(m.group(1)) - 1
+    return f"{start}-{str(start + 1)[-2:]}"
+
+
+def seed_from_prior_season(cfg: SeasonConfig) -> None:
+    """If this season's raw_dir has no data yet, copy the previous season's raw CSVs forward,
+    so update_raw_data only has to fetch the newly-completed season instead of the entire
+    history again — without this, every new season folder starts empty and re-downloads
+    2008-present from scratch on its first run, every single year.
+    """
+    if (cfg.raw_dir / RAW_FILES["team_stats"]).exists():
+        return
+    prior = _prior_season_name(cfg.season)
+    if not prior:
+        return
+    src = cfg.season_dir.parent / prior / "data" / "raw"
+    if not (src / RAW_FILES["team_stats"]).exists():
+        return
+    cfg.raw_dir.mkdir(parents=True, exist_ok=True)
+    for filename in RAW_FILES.values():
+        s = src / filename
+        if s.exists():
+            shutil.copy(s, cfg.raw_dir / filename)
+    logger.info(f"Seeded raw data for {cfg.season} from {src}")
+
+
 def update_raw_data(cfg: SeasonConfig, client: NHLAPIClient | None = None) -> None:
     """Fetch only the seasons missing from cfg.raw_dir, then merge and re-save.
 
@@ -270,6 +303,7 @@ def update_raw_data(cfg: SeasonConfig, client: NHLAPIClient | None = None) -> No
     """
     client = client or NHLAPIClient()
     cfg.raw_dir.mkdir(parents=True, exist_ok=True)
+    seed_from_prior_season(cfg)
 
     current_year = int(cfg.season_id[:4])
     wanted_seasons = season_ids_through(cfg.history_start_year, current_year - 1)
