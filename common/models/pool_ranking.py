@@ -158,7 +158,8 @@ def compute_pool_points(cfg: SeasonConfig, fwd_df: pd.DataFrame, def_df: pd.Data
 # --------------------------------------------------------------------------- outputs
 
 def _rank(df: pd.DataFrame, position: str) -> pd.DataFrame:
-    cols = [c for c in ["player_id", "player_name", "team_abbrev", "projected_games", "pool_points"]
+    cols = [c for c in ["player_id", "player_name", "team_abbrev",
+                        "projected_games", "pool_points", "pool_points_full_season"]
             if c in df.columns]
     out = df[cols].sort_values("pool_points", ascending=False).reset_index(drop=True)
     out.insert(0, "position", position)
@@ -256,6 +257,15 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
         goal_rows[col] = m.predict(goal_rows) if m is not None else np.nan
 
     scored = compute_pool_points(cfg, fwd_rows, def_rows, goal_rows)
+
+    # Also score assuming everyone plays a full season, for comparison
+    fwd_full = fwd_rows.copy(); fwd_full["projected_games"] = cfg.games_per_season
+    def_full = def_rows.copy(); def_full["projected_games"] = cfg.games_per_season
+    goal_full = goal_rows.copy(); goal_full["projected_games"] = cfg.games_per_season
+    scored_full = compute_pool_points(cfg, fwd_full, def_full, goal_full)
+    for pos in scored:
+        scored[pos]["pool_points_full_season"] = scored_full[pos]["pool_points"].values
+
     ranked = {pos: _rank(df, pos) for pos, df in scored.items()}
 
     _write_outputs(cfg, ranked, validations, models)
