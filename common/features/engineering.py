@@ -231,12 +231,13 @@ _MP_GOALIE_COLS = ["xGoals", "xOnGoal", "highDangerShots", "mediumDangerShots", 
 
 
 def join_moneypuck(df: pd.DataFrame, cfg: SeasonConfig, entity: str) -> pd.DataFrame:
-    """Left-join MoneyPuck xG/shot-quality columns (prefixed mp_) by normalized name + season.
+    """Left-join MoneyPuck xG/shot-quality columns (prefixed mp_) onto the NHL API frame.
 
-    MoneyPuck uses its own player IDs, so the join is name+season based and inherently lossy;
-    unmatched rows keep NaN mp_ columns. Missing file or column-name drift degrades to a no-op
-    rather than failing the pipeline. Joined columns are current-season, so callers must lag
-    them (lag_feature_list picks up mp_* automatically) to avoid leakage.
+    Primary join: player_id integer (same value in both sources as 'playerId'/'player_id') +
+    season start year — exact, no name ambiguity. Fallback: normalized name + season for any
+    rows the ID join misses (covers edge cases where playerId is absent in older MP data).
+    Missing file or column-name drift degrades to a no-op. Joined columns are current-season,
+    so callers must lag them (lag_feature_list picks up mp_* automatically) to avoid leakage.
     """
     path = cfg.raw_dir / "moneypuck" / f"moneypuck_{entity}.csv"
     if not path.exists():
@@ -248,10 +249,9 @@ def join_moneypuck(df: pd.DataFrame, cfg: SeasonConfig, entity: str) -> pd.DataF
         logger.warning("Could not read MoneyPuck %s: %s; skipping", entity, e)
         return df
 
-    name_col = next((c for c in ("name", "player", "playerName") if c in mp.columns), None)
     season_col = "season" if "season" in mp.columns else "season_start_year"
-    if name_col is None or season_col not in mp.columns:
-        logger.warning("MoneyPuck %s missing name/season columns; skipping", entity)
+    if season_col not in mp.columns:
+        logger.warning("MoneyPuck %s missing season column; skipping", entity)
         return df
     if "situation" in mp.columns:
         mp = mp[mp["situation"] == "all"]
@@ -262,19 +262,51 @@ def join_moneypuck(df: pd.DataFrame, cfg: SeasonConfig, entity: str) -> pd.DataF
         logger.warning("No expected MoneyPuck %s stat columns present; skipping", entity)
         return df
 
-    mp = mp[[name_col, season_col] + present].copy()
-    mp["_key_name"] = _normalize_name(mp[name_col])
-    mp["_key_year"] = pd.to_numeric(mp[season_col], errors="coerce")
+    mp_prefixed = [f"mp_{c}" for c in present]
     mp = mp.rename(columns={c: f"mp_{c}" for c in present})
-    mp = mp.drop_duplicates(["_key_name", "_key_year"])[["_key_name", "_key_year"] + [f"mp_{c}" for c in present]]
+    mp["_mp_year"] = pd.to_numeric(mp[season_col], errors="coerce")
+    mp["_mp_pid"] = pd.to_numeric(mp.get("playerId"), errors="coerce") if "playerId" in mp.columns else np.nan
+    name_col = next((c for c in ("name", "player", "playerName") if c in mp.columns), None)
+    mp["_mp_name"] = _normalize_name(mp[name_col]) if name_col else ""
 
     df = df.copy()
-    df["_key_name"] = _normalize_name(df["player_name"])
-    df["_key_year"] = df["year"]
-    out = df.merge(mp, on=["_key_name", "_key_year"], how="left").drop(columns=["_key_name", "_key_year"])
-    matched = out[f"mp_{present[0]}"].notna().sum()
-    logger.info("MoneyPuck %s: matched %d/%d rows on name+season", entity, matched, len(out))
-    return out
+    df["_df_pid"] = pd.to_numeric(df["player_id"], errors="coerce")
+    df["_df_year"] = df["year"]
+    df["_df_name"] = _normalize_name(df["player_name"])
+
+    # --- Primary join: player_id + season year ---
+    mp_id = (mp[["_mp_pid", "_mp_year"] + mp_prefixed]
+             .dropna(subset=["_mp_pid"])
+             .drop_duplicates(["_mp_pid", "_mp_year"]))
+    out = df.merge(
+        mp_id.rename(columns={"_mp_pid": "_df_pid", "_mp_year": "_df_year"}),
+        on=["_df_pid", "_df_year"], how="left",
+    )
+    id_matched = out[mp_prefixed[0]].notna().sum()
+
+    # --- Fallback join: normalized name + season for rows the ID join missed ---
+    unmatched_mask = out[mp_prefixed[0]].isna()
+    name_matched = 0
+    if unmatched_mask.any() and name_col is not None:
+        mp_name = (mp[["_mp_name", "_mp_year"] + mp_prefixed]
+                   .drop_duplicates(["_mp_name", "_mp_year"]))
+        unmatched_idx = out.index[unmatched_mask]
+        # reset_index so the merge preserves original positions; restore after
+        fallback = (out.loc[unmatched_idx, ["_df_name", "_df_year"]]
+                    .reset_index()
+                    .merge(mp_name.rename(columns={"_mp_name": "_df_name", "_mp_year": "_df_year"}),
+                           on=["_df_name", "_df_year"], how="left")
+                    .set_index("index"))
+        for col in mp_prefixed:
+            out.loc[unmatched_idx, col] = fallback.loc[unmatched_idx, col]
+        name_matched = out.loc[unmatched_idx, mp_prefixed[0]].notna().sum()
+
+    total = out[mp_prefixed[0]].notna().sum()
+    logger.info(
+        "MoneyPuck %s: %d/%d rows matched (id=%d, name-fallback=%d, unmatched=%d)",
+        entity, total, len(out), id_matched, name_matched, len(out) - total,
+    )
+    return out.drop(columns=["_df_pid", "_df_year", "_df_name"])
 
 
 # --------------------------------------------------------------------------- feature selection
