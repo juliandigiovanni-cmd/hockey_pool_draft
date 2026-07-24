@@ -103,15 +103,81 @@ def _predict_rows(engineer_fn, aug_raw: pd.DataFrame, cfg: SeasonConfig) -> pd.D
     return apply_current_team_overrides(rows, cfg)
 
 
-def _projected_games(raw_df: pd.DataFrame, games_per_season: int, default: int) -> dict:
-    """3-year rolling average of games_played_player per player, capped at games_per_season."""
+def _projected_games(raw_df: pd.DataFrame, games_per_season: int, default: int,
+                     min_gp_per_season: int = 25) -> dict:
+    """3-year rolling average of GP per player, capped at games_per_season.
+
+    Historical seasons with GP < min_gp_per_season are excluded from the average to avoid
+    late-season rookie call-ups (e.g. 15 games in a debut year) biasing the projection
+    downward. The most-recent season is always included regardless of GP — a genuine recent
+    injury should still reduce the projection.
+    """
     df = fe.add_year(raw_df)
     out = {}
     for pid, g in df.sort_values("year").groupby("player_id"):
-        gp = pd.to_numeric(g["games_played_player"], errors="coerce").dropna().tail(3)
-        gp = gp[gp > 0]
-        out[pid] = min(gp.mean(), games_per_season) if len(gp) else default
+        gp_all = pd.to_numeric(g["games_played_player"], errors="coerce").dropna()
+        gp_all = gp_all[gp_all > 0]
+        if len(gp_all) == 0:
+            out[pid] = default
+            continue
+        most_recent = gp_all.iloc[-1:]
+        historical = gp_all.iloc[:-1]
+        historical_full = historical[historical >= min_gp_per_season]
+        use = pd.concat([historical_full, most_recent]).tail(3)
+        out[pid] = min(float(use.mean()), games_per_season)
     return out
+
+
+def _last_season_gp(raw_df: pd.DataFrame) -> dict:
+    """Return {player_id: games_played in their most-recent season in the data}."""
+    df = fe.add_year(raw_df)
+    out = {}
+    for pid, g in df.sort_values("year").groupby("player_id"):
+        gp = pd.to_numeric(g["games_played_player"], errors="coerce").dropna()
+        gp = gp[gp > 0]
+        if len(gp):
+            out[pid] = float(gp.iloc[-1])
+    return out
+
+
+def _write_gp_diagnostic(cfg: SeasonConfig, skater: pd.DataFrame, goalie: pd.DataFrame,
+                         skater_gp_map: dict, goalie_gp_map: dict,
+                         last_skater_gp: dict, last_goalie_gp: dict) -> None:
+    """Log and write a CSV flagging players whose projected GP is well below last season's actual.
+
+    Threshold: projected < 70% of last_season_gp. Helps identify residual call-up bias or
+    players who need a manual review of their GP projection.
+    """
+    THRESHOLD = 0.70
+    rows = []
+    skater_names = dict(zip(skater["player_id"], skater["player_name"]))
+    goalie_names = dict(zip(goalie["player_id"], goalie["player_name"]))
+
+    for gp_map, last_gp_map, name_map, pos in [
+        (skater_gp_map, last_skater_gp, skater_names, "skater"),
+        (goalie_gp_map, last_goalie_gp, goalie_names, "goalie"),
+    ]:
+        for pid, proj in gp_map.items():
+            last = last_gp_map.get(pid, 0)
+            if last > 0:
+                ratio = proj / last
+                rows.append({"player_id": pid, "player_name": name_map.get(pid, str(pid)),
+                             "position_group": pos, "projected_games": round(proj, 1),
+                             "last_season_gp": last, "ratio": round(ratio, 3)})
+
+    df = pd.DataFrame(rows).sort_values("ratio")
+    flagged = df[df["ratio"] < THRESHOLD]
+
+    if not flagged.empty:
+        logger.warning("GP projection anomalies (projected < %.0f%% of last season):", THRESHOLD * 100)
+        for _, r in flagged.head(20).iterrows():
+            logger.warning("  %-26s proj=%4.0f  last_season=%4.0f  ratio=%.2f",
+                           r["player_name"], r["projected_games"], r["last_season_gp"], r["ratio"])
+
+    out_dir = cfg.season_dir / "results" / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "gp_projection_check.csv", index=False)
+    logger.info("Wrote GP projection diagnostic: %s", out_dir / "gp_projection_check.csv")
 
 
 # --------------------------------------------------------------------------- scoring
@@ -248,9 +314,15 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
     skater_aug = _augment_with_prediction_rows(skater, cfg)
     goalie_aug = _augment_with_prediction_rows(goalie, cfg)
 
-    # Per-player projected games: 3-year rolling avg of actual GP, capped at games_per_season
+    # Per-player projected games: 3-year rolling avg of actual GP, capped at games_per_season.
+    # Partial seasons (GP < 25) in historical years are excluded to avoid late-season rookie
+    # call-ups biasing projections downward; the most-recent season is always included.
     skater_gp_map = _projected_games(skater, cfg.games_per_season, default=70)
     goalie_gp_map = _projected_games(goalie, cfg.games_per_season, default=20)
+    last_skater_gp = _last_season_gp(skater)
+    last_goalie_gp = _last_season_gp(goalie)
+    _write_gp_diagnostic(cfg, skater, goalie, skater_gp_map, goalie_gp_map,
+                         last_skater_gp, last_goalie_gp)
 
     # Forwards
     fwd_rows = _predict_rows(fwd.engineer, skater_aug, cfg)
