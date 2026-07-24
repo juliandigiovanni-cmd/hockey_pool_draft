@@ -64,10 +64,11 @@ season's `config.yaml` under `scoring:`.
   awarded to whoever scores highest/lowest, so even a weak model's ranking at the top is
   informative. But this should be revisited: consider predicting the percentile rank rather
   than the raw stat, or switching to a simpler "stability-weighted career average" baseline.
-- **Defense plus/minus OOS R²=0.031**: essentially random out-of-sample. The contemporaneous
-  team-context features (allowed for this target) don't help for future-season prediction
-  because team composition changes. The model is useful only insofar as it captures some
-  signal from lagged team quality. Worth exploring a joint points+plus/minus model (see Future).
+- **Defense plus/minus OOS R²=0.031**: essentially random out-of-sample (OOS concordance ~0.54,
+  barely above the 0.50 chance baseline). Contemporaneous team features were removed — they are
+  NaN at prediction time, causing a training/inference mismatch. Prediction blending (alpha=0.10
+  toward 2-year historical averages) corrects ranking at the extremes. The model adds weak signal
+  as a prior; worth exploring true joint points+plus/minus estimation (see Future).
 - **Traded players — team context**: players who changed teams during a historical season are
   assigned the *first* team listed in the NHL API's comma-joined `team_abbrev`. Their season
   totals (goals, assists, games_played) are preserved correctly; only the team-context features
@@ -79,9 +80,10 @@ season's `config.yaml` under `scoring:`.
 
 ## Known modeling tradeoffs (carried over deliberately, not bugs)
 
-- Defense plus/minus model uses contemporaneous (current-season) team features, while the
-  points model stays strictly lagged — plus/minus is hard to predict from lagged data alone,
-  so this is a documented leakage tradeoff specific to that one target.
+- Defense predictions are blended with 2-year historical averages to correct model compression
+  at the extremes; all features are strictly lagged (no contemporaneous leakage). Blend weights
+  (alpha) are calibrated from OOS concordance: `alpha = 2*(concordance − 0.5)` — alpha=0.45 for
+  points (concordance ~0.72), alpha=0.10 for plus_minus (concordance ~0.54). See `pool_ranking._blend()`.
 - Validation methodology: train on all data vs. train excluding the most recent season and
   check against it out-of-sample; the better-performing approach per position/target is used
   for the final prediction.
@@ -207,19 +209,91 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
     defense_plus_minus OOS R²=0.031; goalie GAA OOS R²=-0.203, goalie Sv% OOS R²=-0.839
     (both worse than predicting the mean — flagged in the metrics table).
 
+- **2026-07-24 — Goalie and defense model failure mode fixes** (commit b5873e1):
+  - Removed QUALIFIED_ONLY training filter from goalies: restored the full training dataset
+    (~1,100 rows vs. ~340 previously). QUALIFIED_ONLY was applied during training but not at
+    prediction time, shrinking the training set for no benefit.
+  - Added `_LINEAR_ONLY = ("ridge","lasso","elastic_net")` constant in `goalies.py`. GAA and
+    save_pct targets now use only regularized linear models: near-zero season-to-season autocorrelation
+    (r≈0.09) means tree models overfit badly, while linear models correctly regress toward the mean.
+  - Added `add_career_averages()` for all goalie rate stats (save_pct, GAA, shutouts/game, wins/game)
+    and for defense plus_minus and plus_minus_per_game. Career averages are leakage-safe (expanding
+    mean with a shift-1 guard) and provide a stable multi-season signal for high-variance rate stats.
+  - Removed contemporaneous team features from defense `build_xy_for()` (`allow_team=False`
+    always): at prediction time, the current season's team stats are NaN → 0, creating a
+    training/inference mismatch for any model that learned on real contemporaneous values.
+
+- **2026-07-24 — Empirical Bayes shrinkage, GSAx features, rank-based OOS metrics** (commit 16637a6):
+  - `add_eb_save_pct()` added to `common/features/engineering.py`. Computes a Beta-Binomial
+    posterior mean save%: `eb_save_pct = (α + saves) / (α + β + shots)`. Prior α and β are fitted
+    by method of moments on seasons with ≥100 shots; fallback prior α=85.0, β=8.5 (centered at 0.909).
+    Shrinks backup goalies aggressively toward the league mean; trusts high-volume starters.
+    Community standard approach per Thomas (2006). `eb_save_pct` is added to `_ENGINEERED_MARKERS`
+    so `select_feature_columns` allowlists it, and is lagged + career-averaged.
+  - GSAx added in `goalies.py` `engineer()`: `gsax = mp_xGoals − goals_against_player` from
+    MoneyPuck columns. Positive = goalie outperformed expected goals allowed given shot difficulty.
+    More persistent than raw save% (literature: r≈0.15–0.30 vs 0.05–0.15).
+  - `hd_shot_pct = mp_highDangerShots / shots_against`: controls for the shot-mix the defense
+    allowed, separating goalie skill from team-quality effects.
+  - `rank_metrics()` added to `common/models/training.py`: Spearman ρ, Kendall τ →
+    concordance = (τ+1)/2, directional accuracy, and bias. Applied universally to all 7 model
+    targets (forwards, defense, goalies). Motivation: R²≈0 doesn't mean the model has no ranking
+    value — pool draft is fundamentally a ranking problem, not a regression problem.
+  - `top1_match_max` and `top1_match_min` added to OOS evaluation: does the model's argmax/argmin
+    match the actual bonus winner? Expected to be low in a single holdout year; more meaningful
+    in rolling OOS across many years.
+  - All new metrics appear in `model_metrics.csv` and the console summary.
+
+- **2026-07-24 — Per-player projected games for forwards and defense** (commit d1a50f6):
+  - `_projected_games()` in `pool_ranking.py` generalized from goalies-only to any position.
+  - Forwards and defense now use a 3-year rolling average of actual games_played_player as their
+    projected GP, capped at `cfg.games_per_season` (was flat 84 for all skaters).
+  - Fallback: 70 games for players with no recent history (vs 20 for goalies).
+  - `pool_points` now reflects injury risk and lineup uncertainty rather than assuming every
+    player plays a full season.
+
+- **2026-07-24 — Full-season comparison column** (commit e0e978c):
+  - `pool_points_full_season` added to all position DataFrames: pool score assuming all players
+    play the full 84-game season (flat projected_games = `cfg.games_per_season`).
+  - Both `pool_points` (per-player projected GP) and `pool_points_full_season` appear in all
+    output CSVs, so the user can compare injury-risk-adjusted vs pure-value rankings side by side.
+
+- **2026-07-24 — Defense prediction blending** (commit 7525bd2):
+  - Diagnosed two root causes of elite D-men ranking too low: (1) gradient boosting compresses
+    top-end predictions — e.g. Makar's lag1 points/game = 1.053, but the model predicted 0.762;
+    (2) elastic net predicted near-constant plus_minus for everyone, erasing meaningful signal.
+  - Fix: `_blend(df, pred_col, ref_col, alpha)` helper in `pool_ranking.py` blends model
+    predictions with 2-year historical per-game averages: `alpha * model_pred + (1−alpha) * hist_avg`.
+  - Alpha calibrated from OOS concordance using `alpha = 2*(concordance − 0.5)`:
+    - `defense_points`: alpha=0.45 (OOS concordance ~0.72; model trusted, hist corrects compression)
+    - `defense_plus_minus`: alpha=0.10 (OOS concordance ~0.54; model barely beats chance; hist dominates)
+  - Reference columns: `points_per_game_hist_avg` and `plus_minus_per_game_hist_avg` (2-year lags
+    already in the engineered data). Falls back to model prediction for new players with no history.
+  - Result: Makar moved from #44 → #4 overall. Top-10 as of 2026-07-24:
+    MacKinnon (F), Kucherov (F), McDavid (F), Makar (D), Draisaitl (F),
+    Pastrnak (F), Bouchard (D), Suzuki (F), Necas (F), Celebrini (F).
+
 ## Future milestones (not in scope for the 2026-27 rebuild)
 
-- **Joint D-men model**: defenseman points directly contribute to team goals-for, which
-  mechanically increases plus/minus. Worth exploring multi-output regression or predicting
-  plus/minus residual after accounting for point contributions.
-- **Goalie model improvement**: season-to-season save% and GAA have low predictability.
-  Candidates: percentile-rank prediction instead of raw stat, stability-weighted career
-  average baseline, Bayesian shrinkage toward league mean, or new features (save% by
-  shot type from MoneyPuck high/medium/low danger breakdowns).
+- **Observation weighting by games_played**: weight goalie training observations by
+  `min(GP, 40) / 40` to down-weight 1–5 start goalies who are pure noise. Requires threading
+  a `sample_weight` optional parameter through `_fit_one()`, `train_and_select()`, and
+  `train_all_vs_exclude_latest()` in `training.py`, and computing weights in goalie
+  `build_xy_for()`. Not yet implemented; safe default=None preserves current behavior for
+  all non-goalie callers.
+- **MultiTaskElasticNet for (GAA, save_pct)**: joint sparsity across the algebraically-linked
+  pair (r=−0.84); a feature is selected for both targets or neither. Use
+  `sklearn.linear_model.MultiTaskElasticNetCV`. Only worth implementing if observation
+  weighting doesn't suffice — the algebraic linkage already means single-target models share
+  most of their signal.
+- **Joint D-men model**: defenseman points mechanically raise their plus/minus (a scored goal
+  by definition is also a positive plus/minus event). Leakage and blending are now fixed;
+  true multi-output regression (predicting plus_minus residual after accounting for point
+  contributions) remains future work.
 - **Majority-team for historical traded players**: game logs currently cover only the most
   recent season. Expanding to full history (one API call per player per historical season)
   would allow assigning each player to the team they played most games for in each historical
-  season, rather than defaulting to the first listed team.
+  season, rather than defaulting to the first team listed.
 - **Interactive draft-day tool**: analyze and select players live during the draft. Lowest
   priority per original spec; nothing built yet.
 - **2027-28 season**: copy `2026-27/config.yaml` → `2027-28/config.yaml`, update

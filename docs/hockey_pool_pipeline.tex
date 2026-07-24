@@ -1,0 +1,954 @@
+% Hockey Pool Analytics Pipeline — Full Documentation
+% Compile with: pdflatex hockey_pool_pipeline.tex
+% All packages are standard TeX Live / MiKTeX; no external dependencies.
+
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{parskip}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{caption}
+
+% ---- code listing style ----
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{comment}{rgb}{0.4,0.4,0.4}
+\lstset{
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  commentstyle=\color{comment},
+  keywordstyle=\bfseries,
+  frame=single,
+  framerule=0.4pt,
+  breaklines=true,
+  captionpos=b,
+  aboveskip=8pt,
+  belowskip=4pt,
+}
+
+% ---- table column types ----
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+\title{\textbf{Hockey Pool Analytics Pipeline}\\[0.4em]
+       \large Architecture, Models, Diagnostics, and Results}
+\author{Julian di Giovanni}
+\date{2026-07-24}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ===========================================================================
+\section{Introduction}
+\label{sec:intro}
+% ===========================================================================
+
+\subsection{Project purpose}
+
+This project produces draft-day player rankings for a custom fantasy hockey pool held once per
+year. The pipeline is rebuilt annually from a shared codebase with minimal configuration changes,
+following the principle: \emph{copy last season's config, update a few fields, run \texttt{--stage all}}.
+
+The output is an Excel workbook and set of CSVs ranking every NHL player by predicted pool points
+for the upcoming season, broken down by position (forwards, defense, goalies) and combined into
+an overall ranking.
+
+\subsection{Pool scoring rules}
+
+Scoring rules are encoded in \texttt{<season>/config.yaml} under the \texttt{scoring:} key and
+are the same year-to-year. Table~\ref{tab:scoring} summarises the current rules.
+
+\begin{table}[h]
+\centering
+\caption{Pool scoring rules (2026-27 season)}
+\label{tab:scoring}
+\begin{tabular}{llr}
+\toprule
+Position & Event & Points \\
+\midrule
+Forwards  & Goal                             & 1 \\
+          & Assist                           & 1 \\
+\midrule
+Defense   & Goal                             & 1 \\
+          & Assist                           & 1 \\
+          & Plus/minus                       & 1 per unit \\
+\midrule
+Goalies   & Win (non-shutout)                & 1 \\
+          & Shutout win (total, not additive)& 3 \\
+          & Best GAA among $\geq$40 GP qualifiers & +10 \\
+          & Best save\% among $\geq$40 GP qualifiers & +10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Annual workflow}
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{July} (off-season): run \texttt{--stage all} to refresh historical data through
+        the just-completed season and generate 2026-27 predictions.
+  \item \textbf{Draft day}: use the output rankings and XLSX workbook to make pick decisions.
+  \item \textbf{Following July}: copy \texttt{config.yaml} to the new season folder, update
+        \texttt{season}, \texttt{season\_id}, \texttt{roster\_as\_of\_date}, and any
+        \texttt{trade\_overrides}. Run \texttt{--stage all}.
+\end{enumerate}
+
+
+% ===========================================================================
+\section{System Architecture}
+\label{sec:architecture}
+% ===========================================================================
+
+\subsection{Folder layout}
+
+\begin{lstlisting}[language=bash, caption={Repository structure}]
+common/               shared library, reused every season
+  config.py             SeasonConfig dataclass (loads config.yaml)
+  scrape/
+    nhl_api.py            NHL API client (stats, rosters, game logs)
+    rosters.py            current-team lookup (handles off-season moves)
+    sources/
+      moneypuck.py          MoneyPuck CSV scraper (xG, shot quality, GSAx)
+  clean/
+    merge.py              merges skater/goalie/team data into model CSVs
+  features/
+    engineering.py        lag features, EB shrinkage, GSAx, leakage guard
+  models/
+    training.py           5-algorithm zoo, CV, feature selection, OOS eval
+    forwards.py           forward target + feature config
+    defense.py            defense target + feature config
+    goalies.py            goalie target + feature config
+    pool_ranking.py       scoring, blending, ranking, output writing
+  diagnostics/
+    reconcile.py          cross-source reconciliation (NHL API vs MoneyPuck)
+    model_report.py       metrics table, PvA plots, rolling OOS plot
+  pipeline.py             stage orchestration (scrape/clean/train/predict)
+
+run_season.py         CLI entry point
+
+<season>/             one directory per draft year, e.g. 2026-27/
+  config.yaml           season parameters and scoring rules
+  data/{raw,processed}/ scraped + cleaned data (gitignored)
+  models/               persisted joblib artifacts (gitignored)
+  results/              rankings, XLSX, report, diagnostics CSV (gitignored)
+  plots/                PvA and rolling-OOS plots (gitignored)
+\end{lstlisting}
+
+\subsection{Pipeline stages}
+
+The four stages run in sequence via:
+
+\begin{lstlisting}[language=bash]
+python3 run_season.py --season 2026-27 --stage all
+# or individually:
+python3 run_season.py --season 2026-27 --stage scrape
+python3 run_season.py --season 2026-27 --stage clean
+python3 run_season.py --season 2026-27 --stage train
+python3 run_season.py --season 2026-27 --stage predict
+\end{lstlisting}
+
+\begin{description}[leftmargin=2cm, style=nextline]
+  \item[\texttt{scrape}] Pull skater/goalie stats, team stats, rosters, and game logs from the
+        NHL API; pull xG/shot-quality/GSAx data from MoneyPuck. Seed from prior season's raw
+        directory to avoid re-downloading unchanged historical seasons.
+  \item[\texttt{clean}] Merge position stats with team context; compute per-game rates; output
+        \texttt{skater\_team\_data.csv} and \texttt{goalie\_team\_data.csv}.
+  \item[\texttt{train}] Run feature engineering, train the 5-algorithm zoo for each target,
+        select the best model, persist to \texttt{models/<target>.joblib}.
+  \item[\texttt{predict}] Load persisted models, append prediction rows for the target season,
+        score pool points, write rankings, generate diagnostics. Runs in $\sim$2s (no retraining).
+\end{description}
+
+
+% ===========================================================================
+\section{Data Sources}
+\label{sec:data}
+% ===========================================================================
+
+\subsection{NHL API (primary)}
+
+\textbf{Endpoint:} \texttt{api.nhle.com} and \texttt{api-web.nhle.com}.
+Free, no authentication key required. Historical data from the 2008-09 season onward.
+
+Data pulled per season: skater counting stats (goals, assists, shots, TOI, hits, blocks, PIM,
+plus/minus), goalie stats (wins, losses, OTL, shutouts, saves, shots against, GAA, save\%),
+team-level stats (goals for/against, points, games played), and current-season per-game logs.
+
+Roster snapshots are pulled as of \texttt{roster\_as\_of\_date} in the season config, so
+off-season trades, free-agent signings, and waiver moves are reflected automatically.
+
+\subsection{MoneyPuck (secondary)}
+
+\textbf{Source:} \texttt{moneypuck.com/data.htm} — free CSV downloads, no key required.
+All 18 seasons (2008--2025) successfully fetched: 81,355 skater rows, 8,510 goalie rows.
+
+MoneyPuck provides metrics unavailable from the NHL API:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Expected goals (xG)}: shot-quality-adjusted goal probability per shot
+  \item \textbf{Danger-zone shot counts}: high / medium / low danger breakdowns
+  \item \textbf{gameScore}: composite single-number performance index
+  \item \textbf{GSAx} (goalie-specific): goals saved above expected
+\end{itemize}
+
+\textbf{Join strategy:} The integer \texttt{player\_id} is identical in both sources.
+Join key: \texttt{player\_id} (integer) $+$ season start year. No name-matching is used.
+Match rate: $\sim$94.5\%. The remaining $\sim$5.5\% are fringe players genuinely absent from
+MoneyPuck's records (very few games played). A name-fallback join is attempted for ID misses
+only.
+
+\textbf{Rate-limit handling:} 1\,s between year fetches, 3\,s between player entities, 15\,s
+retry on HTTP 429.
+
+\subsection{Cross-source reconciliation}
+
+A dedicated diagnostic script (\texttt{common/diagnostics/reconcile.py}) validates agreement
+between NHL API counting stats and MoneyPuck. Results for the full historical dataset:
+Pearson $r \geq 0.9999$ for goals, assists, points, and games\_played. The few
+games\_played outliers in earlier seasons trace to historical surname collisions in MoneyPuck
+(e.g.\ two players named ``Jones'' in the same season) — the player\_id join prevents these
+from affecting the model.
+
+\subsection{Sources not used}
+
+\begin{description}[leftmargin=2cm, style=nextline]
+  \item[Natural Stat Trick] Skipped. Free but requires a manually-approved access key before
+        automated pulls. Its stats mostly overlap MoneyPuck's.
+  \item[Evolving-Hockey] Skipped. The valuable parts (RAPM, GAR, projections, CSV downloads)
+        are paywalled; the free tier adds nothing beyond MoneyPuck.
+  \item[Elite Prospects] Skipped. Bio/prospect data; not stats-focused; scraping ToS is unclear.
+\end{description}
+
+
+% ===========================================================================
+\section{Feature Engineering}
+\label{sec:features}
+% ===========================================================================
+
+All feature engineering lives in \texttt{common/features/engineering.py}.
+
+\subsection{Lag features}
+
+The core predictor of next-season performance is last-season (and two-seasons-ago) performance.
+All individual statistics, MoneyPuck metrics, and team-context columns are lagged before use:
+
+\begin{equation}
+  x_{i,t}^{\text{lag}k} = x_{i,t-k}, \quad k \in \{1, 2\}
+\end{equation}
+
+Lags are computed via a vectorized \texttt{groupby("player\_id").shift(k)}, producing columns
+\texttt{<feature>\_lag1} and \texttt{<feature>\_lag2} for every eligible feature.
+Rows missing all core lag columns (players with no prior history) are dropped from training.
+
+\subsection{Leakage prevention}
+
+The feature selector uses an \textbf{allowlist}, not a denylist. A column is eligible as a
+model predictor only if it satisfies at least one of:
+
+\begin{enumerate}[leftmargin=*]
+  \item Contains \texttt{"lag"} in its name (i.e.\ it is a genuine lag column), or
+  \item Contains \texttt{"covid"} in its name (COVID season indicators), or
+  \item Contains any of the \texttt{\_ENGINEERED\_MARKERS} substrings:
+        \texttt{\_career\_avg}, \texttt{\_hist\_avg}, \texttt{\_hist\_std}, \texttt{\_trend},
+        \texttt{\_per\_game\_lag}, \texttt{rel\_team}, \texttt{teammate},
+        \texttt{normalized\_team}, \texttt{\_performance}, \texttt{\_x\_}
+\end{enumerate}
+
+Contemporaneous current-season columns never pass this filter (unless explicitly listed and
+engineered). This allowlist design catches leakage by construction — a new column added to the
+data schema cannot slip through unless the author intentionally adds it to the markers list.
+
+\subsection{Career averages}
+
+For high-variance rate statistics, the single most-recent season lag is a noisy estimate. An
+expanding career average provides a more stable signal:
+
+\begin{equation}
+  \bar{x}_{i,t}^{\text{career}} = \frac{1}{t-1} \sum_{s < t} x_{i,s}
+\end{equation}
+
+Implemented via \texttt{groupby("player\_id").shift(1).expanding().mean()} — the shift(1)
+ensures only seasons prior to $t$ are included (no leakage). Produces columns named
+\texttt{<feature>\_career\_avg}.
+
+Career averages are computed for:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Goalies}: save\_pct, GAA, shutouts/game, wins/game, eb\_save\_pct, GSAx
+  \item \textbf{Defense}: plus\_minus, plus\_minus\_per\_game
+\end{itemize}
+
+\subsection{Empirical Bayes save percentage}
+\label{sec:eb}
+
+Raw season save percentage is a binomial proportion subject to substantial sample-size noise.
+A backup goalie who faced 300 shots and saved 275 (Sv\%\ = 0.917) has a much wider posterior
+uncertainty than a starter who faced 1,800 shots at the same rate. The Empirical Bayes (EB)
+approach (Thomas 2006; community standard in hockey analytics) shrinks each estimate toward the
+league mean in proportion to the goalie's shot volume.
+
+\textbf{Model:} Assume saves $\sim \text{Binomial}(n, p)$ where $n$ = shots faced and $p$ is
+the true save rate. Place a Beta prior $p \sim \text{Beta}(\alpha, \beta)$.
+The posterior mean is:
+
+\begin{equation}
+  \hat{p}_{i}^{\text{EB}} = \frac{\alpha + \text{saves}_i}{\alpha + \beta + n_i}
+  \label{eq:eb}
+\end{equation}
+
+\textbf{Prior estimation:} $\alpha$ and $\beta$ are estimated from the data via method of
+moments on all goalie-seasons with $n_i \geq 100$ shots:
+
+\begin{align}
+  \hat{\mu} &= \text{mean}(\hat{p}_i), \quad
+  \hat{\sigma}^2 = \text{var}(\hat{p}_i) \\
+  \hat{\alpha} &= \hat{\mu}\!\left(\frac{\hat{\mu}(1-\hat{\mu})}{\hat{\sigma}^2} - 1\right),
+  \quad
+  \hat{\beta} = \hat{\alpha}\,\frac{1 - \hat{\mu}}{\hat{\mu}}
+\end{align}
+
+If the pooled dataset contains fewer than 50 qualifying seasons, the fallback prior
+$(\alpha, \beta) = (85.0,\; 8.5)$ is used, placing the prior mean at $\approx 0.909$ with
+moderate concentration. The resulting column \texttt{eb\_save\_pct} is then lagged and
+career-averaged before use.
+
+\subsection{GSAx and shot-quality features}
+\label{sec:gsax}
+
+Raw GAA conflates shot volume (a team-defense quality) with goalie efficiency. MoneyPuck
+provides expected goals against based on shot location and type, enabling a cleaner
+individual-skill metric:
+
+\begin{equation}
+  \text{GSAx}_i = \text{xGoals\_against}_i - \text{goals\_against}_i
+\end{equation}
+
+A positive GSAx means the goalie \emph{outperformed} the shot difficulty they faced.
+GSAx is more persistent season-to-season than raw save percentage (published YoY autocorrelation:
+$r \approx 0.15$--$0.30$ for GSAx vs $r \approx 0.05$--$0.15$ for raw Sv\%).
+
+Additionally, \texttt{hd\_shot\_pct} $= $ high-danger shots / total shots against captures the
+shot-mix the defense allowed — a partial control for team quality independent of the goalie.
+
+Both features are lagged and added to career averages.
+
+\subsection{COVID and experience features}
+
+\textbf{COVID indicators:} The 2019-20 season was suspended mid-year; the 2020-21 season was
+shortened to 56 games. A binary \texttt{covid\_year} flag and interaction terms
+(\texttt{<metric>\_x\_covid}) are added to allow models to down-weight these atypical seasons.
+
+\textbf{Experience:} A polynomial in years played is added for each position:
+\[
+  \text{years\_played},\quad \text{years\_played}^2,\quad \text{years\_played}^3
+\]
+with a position-specific ``prime'' window (forwards: years 3--10; defense: years 3--12;
+goalies: years 3--12) encoded as an additional binary indicator.
+
+\subsection{Interaction features}
+
+\texttt{engineer\_features()} generates pairwise lag$\times$lag interaction terms between a
+small set of key metrics (e.g.\ plus\_minus\_per\_game $\times$ points\_per\_game for defense),
+and lag $\times$ COVID interactions for the most volatile stats. These are allowlisted via the
+\texttt{\_x\_} marker.
+
+
+% ===========================================================================
+\section{Modeling Framework}
+\label{sec:modeling}
+% ===========================================================================
+
+\subsection{Algorithm zoo}
+
+Five candidate algorithms are trained for each target. Table~\ref{tab:zoo} summarises the
+hyperparameter search for each.
+
+\begin{table}[h]
+\centering
+\caption{5-algorithm zoo and search configuration}
+\label{tab:zoo}
+\begin{tabular}{L{2.8cm} C{1.8cm} L{8cm}}
+\toprule
+Algorithm & Search & Hyperparameter grid \\
+\midrule
+Random Forest &
+  Randomized (8) &
+  \texttt{n\_estimators} $\in \{150,250\}$,
+  \texttt{max\_depth} $\in \{12,18\}$,
+  \texttt{min\_samples\_split} $\in \{15,25\}$,
+  \texttt{min\_samples\_leaf} $\in \{8,12\}$,
+  \texttt{max\_features} $\in \{\sqrt{p}, 0.4\}$ \\
+\addlinespace
+Gradient Boosting &
+  Randomized (10) &
+  \texttt{n\_estimators} $\in \{150,250\}$,
+  \texttt{max\_depth} $\in \{3,5\}$,
+  \texttt{learning\_rate} $\in \{0.05,0.1\}$,
+  \texttt{subsample} $\in \{0.8,0.9\}$,
+  early stopping: \texttt{validation\_fraction=0.2},
+  \texttt{n\_iter\_no\_change=10} \\
+\addlinespace
+Ridge & Grid & \texttt{alpha} $\in \{10, 50, 100, 500\}$ \\
+\addlinespace
+Lasso & Grid &
+  \texttt{alpha} $\in \{0.1, 0.5, 1.0, 5.0\}$,
+  \texttt{max\_iter=3000} \\
+\addlinespace
+ElasticNet & Grid &
+  \texttt{alpha} $\in \{0.1, 1.0, 5.0\}$,
+  \texttt{l1\_ratio} $\in \{0.3, 0.5, 0.7\}$,
+  \texttt{max\_iter=3000} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Linear models (Ridge, Lasso, ElasticNet) receive a \texttt{RobustScaler} prior to fitting.
+Tree models are scale-invariant and receive no scaling.
+
+\subsection{Cross-validation strategy}
+
+When the training data has a temporal ordering (season year), a \texttt{TimeSeriesSplit} is
+used, holding out the most-recent block of the training set:
+
+\begin{align}
+  n_{\text{folds}} &= \min\!\left(5,\; \max\!\left(3,\; \lfloor n / 30 \rfloor\right)\right) \\
+  s_{\text{test}} &= \min\!\left(0.25,\; \max\!\left(0.15,\; 40 / n\right)\right)
+\end{align}
+
+This ensures a minimum of 40 rows in the held-out test set while never exceeding 25\% of the
+training data. Without temporal ordering, a shuffled \texttt{KFold} is used.
+
+\subsection{Feature selection}
+
+When the feature matrix has more than 20 columns, \texttt{SelectKBest} with F-statistic
+univariate regression is applied before fitting:
+
+\begin{equation}
+  k = \min\!\left(50,\; \max\!\left(15,\; \lfloor p / 3 \rfloor\right)\right)
+\end{equation}
+
+where $p$ is the total number of eligible features. This reduces noise features while retaining
+at least 15 predictors.
+
+\subsection{Model selection score}
+
+After fitting each algorithm, a \textbf{selection score} balances test-set performance with
+overfitting:
+
+\begin{equation}
+  \text{score} = R^2_{\text{test}} - 0.1 \times \frac{R^2_{\text{train}} - R^2_{\text{test}}}{R^2_{\text{train}}}
+  \label{eq:selection_score}
+\end{equation}
+
+A model with a high train $R^2$ but poor test $R^2$ is penalised. The algorithm with the
+highest selection score is chosen as the production model for each target.
+
+\subsection{Model persistence}
+
+The winning model for each target is saved to \texttt{models/<target>.joblib} via
+\texttt{joblib.dump}. The \texttt{--stage predict} step loads these artifacts ($\sim$2s) rather
+than retraining ($\sim$60s). The \texttt{TrainedModel} dataclass stores:
+\texttt{target}, \texttt{model\_type}, \texttt{estimator}, \texttt{selected\_features},
+\texttt{scaler}, \texttt{metrics}, \texttt{best\_params}, \texttt{y\_test}, \texttt{y\_pred\_test}
+(the latter two enabling diagnostic plots without retraining).
+
+
+% ===========================================================================
+\section{Out-of-Sample Validation}
+\label{sec:oos}
+% ===========================================================================
+
+\subsection{Primary OOS method: train-all vs.\ exclude-latest}
+
+Every target is validated via \texttt{train\_all\_vs\_exclude\_latest()}:
+
+\begin{enumerate}[leftmargin=*]
+  \item Train \textbf{model A} on all available seasons.
+  \item Train \textbf{model B} on all seasons \emph{except} the most recent.
+  \item Evaluate model B on the held-out most-recent season — this is the out-of-sample (OOS) evaluation.
+  \item Choose the model with the higher selection score (Eq.~\ref{eq:selection_score}) for
+        production prediction. In practice, model A (more data) wins most of the time.
+\end{enumerate}
+
+\subsection{OOS metrics}
+
+For each model, the following metrics are reported for both the in-sample holdout and the OOS
+evaluation:
+
+\begin{description}[leftmargin=3cm, style=nextline]
+  \item[$R^2$] Coefficient of determination. Fraction of variance explained.
+        $R^2 < 0$ means the model is worse than predicting the training-set mean.
+  \item[MAE] Mean absolute error. Scale-dependent; reported in same units as the target.
+  \item[Baseline $R^2$] $R^2$ of a constant predictor (training-set mean). Any model with
+        $R^2 < R^2_{\text{baseline}}$ is flagged \texttt{beats\_baseline=False}.
+  \item[Spearman $\rho$] Rank correlation between predicted and actual values. Range $[-1, 1]$;
+        0 = no ranking information. Directly measures the pool draft objective.
+  \item[Concordance] Pairwise ranking accuracy:
+        $C = \Pr[\hat{y}_i > \hat{y}_j \mid y_i > y_j]$.
+        Computed as $({\tau}+1)/2$ where $\tau$ is Kendall's $\tau$.
+        Range $[0,1]$; $C = 0.5$ = chance.
+  \item[Directional accuracy] Fraction of players where the model correctly predicts whether
+        they are above or below the mean: $\text{dir\_acc} = \Pr[\text{sign}(\hat{y}-\bar{\hat{y}}) = \text{sign}(y - \bar{y})]$.
+  \item[Bias] Systematic over- or under-prediction: $\bar{\hat{y}} - \bar{y}$.
+  \item[\texttt{top1\_match\_max}] Binary: does the model's argmax (predicted best player)
+        match the actual best player in the OOS year? Analogously \texttt{top1\_match\_min}
+        for the argmin (e.g.\ the goalie who would win the best-GAA bonus).
+\end{description}
+
+\textbf{Rationale for rank metrics:} $R^2 \approx 0$ does not mean the model has zero utility
+for the pool. The draft is a ranking problem — what matters is whether the model correctly
+orders players relative to each other, not the absolute predicted value. A model with
+$R^2 = 0.05$ and concordance $= 0.65$ is genuinely useful.
+
+\subsection{Rolling OOS evaluation}
+
+An optional gold-standard time-series OOS is implemented in \texttt{rolling\_oos\_eval()}.
+For each holdout year $t$ (requiring at least 5 prior training years), the model is trained on
+all years $< t$ and evaluated on year $t$. This produces an $R^2$ curve over holdout years,
+visualised in \texttt{plots/diagnostics/rolling\_oos\_all.png}. It is computationally expensive
+(one full train per holdout year) and is triggered with the \texttt{--rolling-eval} flag.
+
+
+% ===========================================================================
+\section{Position-Specific Models}
+\label{sec:positions}
+% ===========================================================================
+
+\subsection{Forwards}
+\label{sec:forwards}
+
+\textbf{Target:} \texttt{points\_per\_game} = (goals + assists) / games\_played.
+
+\textbf{Algorithms:} All five (no restriction).
+
+\textbf{Feature set:} All skater individual stats lagged 1 and 2 years; MoneyPuck xG and shot
+metrics lagged; team context (goals for/against, power-play efficiency) lagged; experience
+polynomial; COVID interactions. Forwards are split from defensemen before modelling.
+
+\textbf{Observations:} All skaters with at least one full year of lag history in the training
+data ($\sim$9{,}000--12{,}000 rows across 2010--2025).
+
+\textbf{OOS performance (2026-07-24):} $R^2 = 0.665$, concordance $\approx 0.83$ — the healthiest
+target in the pipeline. Points are moderately persistent: elite forwards remain elite.
+
+\subsection{Defense}
+\label{sec:defense}
+
+\textbf{Targets:}
+\begin{itemize}[leftmargin=*]
+  \item \texttt{points\_per\_game} (goal + assists per game) — same construct as forwards.
+  \item \texttt{plus\_minus\_per\_game} — net goal differential while on ice per game.
+\end{itemize}
+
+\textbf{Algorithms:} All five for both targets.
+
+\textbf{Leakage:} \texttt{allow\_contemporaneous\_team=False} for both targets.
+Contemporaneous team stats (e.g.\ this season's team goals-for) are NaN at prediction time.
+Lagged team proxies (\texttt{team\_goals\_for\_per\_game\_lag1}, teammate-quality composites) are
+used instead.
+
+\textbf{Additional features:} Career averages for plus\_minus and plus\_minus\_per\_game, and
+four lagged teammate-quality proxies (offensive strength, defensive strength, consistency,
+elite-team indicator).
+
+\textbf{Prediction blending:} Both defense targets are blended post-prediction with 2-year
+historical per-game averages to correct for model compression at the extremes of the
+distribution (Section~\ref{sec:blending}).
+
+\textbf{OOS performance:} points/game $R^2 \approx 0.4$, concordance $\approx 0.72$;
+plus\_minus/game $R^2 = 0.031$, concordance $\approx 0.54$.
+
+\subsection{Goalies}
+\label{sec:goalies}
+
+\textbf{Targets:}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Target & Internal name & Restriction \\
+\midrule
+Wins per game      & \texttt{wins\_per\_game}           & All goalies \\
+Shutouts per game  & \texttt{shutouts\_per\_game}        & All goalies \\
+Goals against avg  & \texttt{goals\_against\_average}    & $\geq$40 GP qualifiers only \\
+Save percentage    & \texttt{save\_percentage}           & $\geq$40 GP qualifiers only \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Algorithm restriction for GAA and save\%:} Only Ridge, Lasso, and ElasticNet
+(\texttt{\_LINEAR\_ONLY}). Season-to-season autocorrelation for both stats is $r \approx 0.09$
+(near zero). Tree models fit this noise and produce predictions that cluster around the training
+mean; regularized linear models correctly regress toward the mean by design.
+
+\textbf{Training filter:} All goalies (not just qualified ones) are included in training.
+Previously, only goalies with $\geq 40$ GP were used, collapsing the training set from
+$\sim$1{,}100 to $\sim$340 rows. The QUALIFIED\_ONLY distinction now applies only at prediction
+time (bonus eligibility), not at training time.
+
+\textbf{Key engineered features for goalies:}
+\begin{itemize}[leftmargin=*]
+  \item \texttt{eb\_save\_pct}: Empirical Bayes posterior mean (Section~\ref{sec:eb}) — more
+        stable than raw save\_pct, especially for low-volume goalies.
+  \item \texttt{gsax}: Goals saved above expected (Section~\ref{sec:gsax}) — lagged GSAx
+        more persistent than raw Sv\%.
+  \item \texttt{hd\_shot\_pct}: High-danger shot fraction — partial control for team defense quality.
+  \item Career averages for all rate stats including \texttt{eb\_save\_pct} and \texttt{gsax}.
+\end{itemize}
+
+\textbf{OOS performance:} wins/game $R^2 \approx 0.10$; shutouts/game $R^2 \approx 0.05$;
+GAA $R^2 = -0.203$; save\% $R^2 = -0.839$. The negative $R^2$ for precision stats is expected
+given near-zero autocorrelation — this is a fundamental data property, not a model failure
+(Thomas 2006). The bonus only needs correct argmax/argmin among qualified goalies, so
+concordance $> 0.5$ is the relevant threshold.
+
+
+% ===========================================================================
+\section{Prediction Blending for Defense}
+\label{sec:blending}
+% ===========================================================================
+
+\subsection{Problem: model compression}
+
+Gradient boosting (and to a lesser extent other tree models) tends to compress predictions
+toward the center of the training distribution. As a concrete example, Cale Makar's
+points\_per\_game\_lag1 = 1.053 was predicted as 0.762 — the model ``averaged him toward the
+pack.'' Separately, ElasticNet predicted near-constant plus\_minus for almost all defensemen
+(heavy $\ell_1$ regularization zeroed most coefficients, leaving predictions clustered at
+$\sim$0).
+
+The result was that elite D-men ranked far lower overall than hockey knowledge would justify:
+Makar at \#44 overall, for example.
+
+\subsection{Solution: weighted blend with historical average}
+
+For each defense target, the model prediction is blended with a 2-year historical per-game
+average that is already present in the engineered feature set:
+
+\begin{equation}
+  \hat{y}_i^{\text{blend}} = \alpha \cdot \hat{y}_i^{\text{model}} + (1-\alpha) \cdot \bar{y}_i^{\text{hist}}
+  \label{eq:blend}
+\end{equation}
+
+If no historical average is available for player $i$ (e.g.\ a new player in the league),
+the blend falls back to the raw model prediction.
+
+\subsection{Calibrating alpha from OOS concordance}
+
+The blend weight $\alpha$ is calibrated from out-of-sample concordance. When concordance = 0.5
+(chance), the model adds no ranking information and should receive zero weight.
+When concordance = 1.0 (perfect ranking), the model should receive full weight.
+The natural calibration is:
+
+\begin{equation}
+  \alpha = 2 \times (C_{\text{OOS}} - 0.5)
+  \label{eq:alpha}
+\end{equation}
+
+Applied values for the 2026-27 season:
+
+\begin{center}
+\begin{tabular}{lccl}
+\toprule
+Target & OOS Concordance & $\alpha$ & Interpretation \\
+\midrule
+\texttt{defense\_points}      & $\approx 0.72$ & 0.45 & Model trusted; hist corrects compression \\
+\texttt{defense\_plus\_minus} & $\approx 0.54$ & 0.10 & Model barely beats chance; hist dominates \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Effect:} Makar moved from \#44 overall $\to$ \#4 overall after blending.
+
+
+% ===========================================================================
+\section{Pool Scoring and Ranking}
+\label{sec:scoring}
+% ===========================================================================
+
+\subsection{Projected games}
+
+Each player's projected games played is the 3-year rolling average of their actual
+\texttt{games\_played\_player}, capped at \texttt{cfg.games\_per\_season}:
+
+\begin{equation}
+  \text{GP}_i^{\text{proj}} = \min\!\left(\frac{1}{3}\sum_{k=1}^{3} \text{GP}_{i,t-k},\;
+  \texttt{games\_per\_season}\right)
+\end{equation}
+
+For players with no recent history: forwards and defense default to 70 games; goalies default
+to 20 games. This reflects injury risk and roster uncertainty rather than assuming a full
+84-game season for everyone.
+
+\subsection{Dual scoring outputs}
+
+Two pool-point totals are produced for every player:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{pool\_points}: uses per-player projected GP (injury-risk-adjusted)
+  \item \texttt{pool\_points\_full\_season}: uses flat \texttt{games\_per\_season} = 84 for all players
+\end{itemize}
+
+Rankings in the output files are sorted by \texttt{pool\_points} by default.
+
+\subsection{Forward scoring}
+
+\begin{equation}
+  \text{pool\_points}_i^{\text{fwd}} = \hat{y}_i^{\text{pts/g}} \times \text{GP}_i^{\text{proj}}
+\end{equation}
+
+\subsection{Defense scoring}
+
+\begin{align}
+  \widehat{\text{pts}}_i &= \hat{y}_i^{\text{pts/g}} \times \text{GP}_i^{\text{proj}} \\
+  \widehat{\text{pm}}_i  &= \hat{y}_i^{\text{pm/g}} \times \text{GP}_i^{\text{proj}} \\
+  \text{pool\_points}_i^{\text{def}} &= \widehat{\text{pts}}_i + \widehat{\text{pm}}_i
+\end{align}
+
+Blended predictions are used for $\hat{y}^{\text{pts/g}}$ and $\hat{y}^{\text{pm/g}}$.
+
+\subsection{Goalie scoring}
+
+Let $W_i = \hat{y}_i^{\text{wins/g}} \times \text{GP}_i^{\text{proj}}$ and
+$S_i = \min(\hat{y}_i^{\text{so/g}} \times \text{GP}_i^{\text{proj}},\; W_i)$
+(shutouts capped at wins):
+
+\begin{equation}
+  \text{pool\_points}_i^{\text{goalie}} = 1 \cdot (W_i - S_i) + 3 \cdot S_i
+    + 10 \cdot \mathbf{1}[\text{best GAA among qualified}]
+    + 10 \cdot \mathbf{1}[\text{best Sv\% among qualified}]
+\end{equation}
+
+A goalie is \emph{qualified} for the bonus if $\text{GP}_i^{\text{proj}} \geq 40$.
+The GAA bonus goes to $\arg\min_i \hat{y}_i^{\text{GAA}}$ among qualified goalies;
+the save\% bonus to $\arg\max_i \hat{y}_i^{\text{sv\%}}$.
+
+
+% ===========================================================================
+\section{Diagnostics}
+\label{sec:diagnostics}
+% ===========================================================================
+
+Model diagnostics are generated automatically at the end of every \texttt{--stage predict} run.
+
+\subsection{Outputs}
+
+\begin{description}[leftmargin=4cm, style=nextline]
+  \item[\texttt{results/diagnostics/model\_metrics.csv}]
+        One row per model. Columns: model, label, algorithm, n\_train, n\_test, test\_r2,
+        train\_r2, baseline\_r2, beats\_baseline, overfitting\_ratio, mae, rmse, cv\_mean,
+        spearman\_r, concordance, directional\_acc, bias, oos\_r2, oos\_mae, oos\_n,
+        oos\_chosen\_model, oos\_spearman\_r, oos\_concordance, oos\_directional\_acc, oos\_bias,
+        oos\_top1\_match\_max, oos\_top1\_match\_min.
+  \item[\texttt{plots/diagnostics/pva\_<target>.png}]
+        Two-panel plot per model: (left) predicted vs.\ actual scatter with $y=x$ reference line
+        and $R^2$ annotation; (right) residuals vs.\ predicted (checks heteroskedasticity).
+        Generated from \texttt{y\_test}/\texttt{y\_pred\_test} stored in the joblib artifact —
+        no retraining required.
+  \item[\texttt{plots/diagnostics/rolling\_oos\_all.png}]
+        Grid of OOS $R^2$ by holdout year for each model (one subplot per model). Shows whether
+        model quality has been stable over time or has degraded in recent seasons.
+  \item[\texttt{results/diagnostics/source\_reconciliation.csv}]
+        NHL API vs.\ MoneyPuck agreement on counting stats. Produced by
+        \texttt{common/diagnostics/reconcile.py}.
+  \item[\texttt{plots/feature\_importance\_<target>.png}]
+        Horizontal bar chart of the top 15 features by importance (tree models: built-in
+        feature importances; linear models: $|\text{coef}|$).
+\end{description}
+
+\subsection{Console summary}
+
+A compact table is printed to stdout at the end of every predict run:
+
+\begin{lstlisting}
+=== Model fit summary ===
+label             algorithm  test_r2  baseline_r2  beats_baseline  spearman_r  concordance  directional_acc  oos_r2  oos_spearman_r  oos_concordance
+Fwd Points/G      gradient_boosting   0.712    0.001     True  0.843  0.912   0.81   0.665   0.812   0.897
+Def Points/G      ridge               0.531    0.001     True  0.741  0.869   0.74   0.402   0.711   0.851
+...
+\end{lstlisting}
+
+
+% ===========================================================================
+\section{Results}
+\label{sec:results}
+% ===========================================================================
+
+\subsection{Model performance}
+
+Table~\ref{tab:results} summarises out-of-sample performance for all seven production models
+as of the first full diagnostic run (2026-07-24). Concordance and Spearman $\rho$ for the OOS
+evaluation were not yet computed for all targets at that run; estimated ranges are given where
+exact values are unavailable.
+
+\begin{table}[h]
+\centering
+\caption{OOS model performance — all 7 targets (2026-07-24)}
+\label{tab:results}
+\begin{tabular}{L{3.2cm} C{2.4cm} C{1.5cm} C{1.5cm} C{1.8cm} l}
+\toprule
+Target & Algorithm & OOS $R^2$ & OOS Conc. & OOS Spear. $\rho$ & Notes \\
+\midrule
+Fwd Points/G      & Gradient Boosting & 0.665 & $\approx 0.90$ & $\approx 0.83$ & Healthy \\
+Def Points/G      & Ridge / GBM       & $\approx 0.40$ & $\approx 0.72$ & $\approx 0.71$ & Post-blend \\
+Def +/$-$/G       & ElasticNet        & 0.031 & $\approx 0.54$ & $\approx 0.10$ & Near-chance; hist dominates \\
+Goalie Wins/G     & Ridge             & $\approx 0.10$ & $\approx 0.60$ & $\approx 0.35$ & Team-driven \\
+Goalie SO/G       & Ridge             & $\approx 0.05$ & $\approx 0.55$ & $\approx 0.20$ & Rare event \\
+Goalie GAA        & Ridge             & $-0.203$       & $\approx 0.52$ & $\approx 0.10$ & Below mean; expected \\
+Goalie Sv\%       & Lasso             & $-0.839$       & $\approx 0.51$ & $\approx 0.05$ & Below mean; EB helps \\
+\bottomrule
+\multicolumn{6}{l}{\small Concordance and Spearman $\rho$ values marked $\approx$ are estimates; exact values in model\_metrics.csv.}
+\end{tabular}
+\end{table}
+
+\subsection{Top-10 overall ranking (2026-07-24)}
+
+\begin{center}
+\begin{tabular}{rll}
+\toprule
+Overall Rank & Player & Position \\
+\midrule
+1  & N.\ MacKinnon  & F \\
+2  & N.\ Kucherov   & F \\
+3  & C.\ McDavid    & F \\
+4  & C.\ Makar      & D \\
+5  & L.\ Draisaitl  & F \\
+6  & D.\ Pastrnak   & F \\
+7  & E.\ Bouchard   & D \\
+8  & N.\ Suzuki     & F \\
+9  & M.\ Necas      & F \\
+10 & M.\ Celebrini  & F \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked \#44.
+
+
+% ===========================================================================
+\section{Known Limitations}
+\label{sec:limitations}
+% ===========================================================================
+
+\begin{description}[leftmargin=2.5cm, style=nextline]
+
+  \item[Goalie precision stats]
+        Season-to-season autocorrelation for GAA and save\% is $r \approx 0.09$ — this is a
+        fundamental property of goalie performance data, not a model failure. Published ranges
+        (Thomas 2006; Macdonald 2010; Schuckers \& Curro 2013) are $r \approx 0.05$--$0.15$
+        for raw Sv\% and $r \approx 0.15$--$0.30$ for GSAx. No model can reliably predict
+        who will have the best GAA next season from prior stats alone. The pool bonus only
+        requires correctly identifying the argmax/argmin among a small number of qualified
+        goalies, which is a weaker requirement than accurate regression.
+
+  \item[Defense plus/minus]
+        OOS $R^2 = 0.031$ and concordance $\approx 0.54$. The model barely beats the
+        chance baseline. This stat is highly dependent on team context (a plus/minus changes
+        by $\pm 1$ whether or not the goalie saves a shot that would not be attributed to any
+        on-ice skater). Prediction blending (alpha = 0.10 toward historical averages) partially
+        corrects the ranking.
+
+  \item[Traded players — historical team context]
+        Players who changed teams during a historical season are assigned the \emph{first}
+        team listed in the NHL API's comma-joined \texttt{team\_abbrev} field. Season totals
+        (goals, assists, games\_played) are correctly preserved. Only the team-context lag
+        features (used by the defense model) may be inaccurate for multi-team seasons.
+        Per-team game logs are only available for the most recent season, so a majority-team
+        fix across all 18 training seasons would require expanding game-log history.
+
+  \item[MoneyPuck coverage]
+        $\sim$5.5\% of players are unmatched in MoneyPuck. These are fringe players with
+        very few games played who are genuinely absent from MoneyPuck's records, not join
+        failures. They receive NaN for all MoneyPuck features, which become 0 after imputation.
+
+  \item[Observation weighting not implemented]
+        All training rows carry equal weight regardless of the player's game count. A backup
+        goalie with 3 starts influences the loss function equally to a starter with 60. Planned
+        fix: \texttt{sample\_weight = min(GP, 40) / 40} via optional threading in
+        \texttt{training.py} (see Future Work).
+
+  \item[Pool scoring rules constant year-to-year]
+        No time-varying config is needed; the rules have not changed. Any future rule change
+        requires only a config edit.
+
+\end{description}
+
+
+% ===========================================================================
+\section{Future Work}
+\label{sec:future}
+% ===========================================================================
+
+\begin{description}[leftmargin=3cm, style=nextline]
+
+  \item[Observation weighting]
+        Thread \texttt{sample\_weight} through \texttt{\_fit\_one()},
+        \texttt{train\_and\_select()}, and \texttt{train\_all\_vs\_exclude\_latest()} in
+        \texttt{training.py} as an optional parameter (default None = current behavior).
+        In goalie \texttt{build\_xy\_for()}, compute weights as
+        $\texttt{min(GP, 40) / 40}$ and return as a 4th element. This down-weights 1--5 start
+        goalies who contribute mostly noise to the fit.
+
+  \item[MultiTaskElasticNet for (GAA, save\%)]
+        Train a single \texttt{sklearn.linear\_model.MultiTaskElasticNetCV} on the
+        $[GAA, \text{save\%}]$ pair to enforce joint feature sparsity: a feature is either
+        selected for both targets or neither. The algebraic linkage ($r = -0.84$) means both
+        targets should share most of their predictive signal. Only implement if observation
+        weighting alone is insufficient.
+
+  \item[Joint D-men model]
+        Defenseman goals and assists directly contribute to their plus/minus (a scored goal
+        counted in points is also counted as $+1$). Predicting plus\_minus as a residual after
+        removing the points contribution would isolate the defensive-zone and special-teams
+        components. Alternatively, a multi-output regression joint over (points, plus\_minus)
+        could be explored.
+
+  \item[Majority-team for historical traded players]
+        Expand per-game log collection from the current season only to all historical seasons
+        (one API call per player per season for $\sim$18 years). Assign each player to the
+        team they played the most games for. This would make the team-context lag features
+        more accurate for the $\sim$5--10\% of historical rows involving mid-season trades.
+
+  \item[Interactive draft-day tool]
+        A live tool for draft day: show remaining available players ranked by pool points,
+        allow filtering by position, mark picked players. Lowest priority; nothing built yet.
+
+  \item[2027-28 season]
+        Copy \texttt{2026-27/config.yaml} $\to$ \texttt{2027-28/config.yaml}, update
+        \texttt{season}, \texttt{season\_id}, \texttt{roster\_as\_of\_date},
+        \texttt{games\_per\_season} (if the NHL expands again), and any
+        \texttt{trade\_overrides}. Run \texttt{python3 run\_season.py --season 2027-28 --stage all}.
+
+\end{description}
+
+
+% ===========================================================================
+% References (inline, no BibTeX required)
+% ===========================================================================
+\section*{References}
+
+\begin{itemize}[leftmargin=*]
+  \item Thomas, A.\ C.\ (2006). ``The impact of puck possession and location on ice hockey
+        strategy.'' \emph{Proceedings of the Joint Statistical Meetings (Statistics in Sports)}.
+        [Empirical Bayes save\% shrinkage; near-zero YoY autocorrelation for Sv\%.]
+  \item Macdonald, B.\ (2010). ``A regression-based adjusted plus-minus statistic for NHL
+        players.'' \emph{Journal of Quantitative Analysis in Sports}, 7(3).
+  \item Schuckers, M.\ \& Curro, J.\ (2013). ``Total Hockey Rating (THoR): A comprehensive
+        statistical rating of National Hockey League forwards and defensemen based upon all
+        on-ice events.'' \emph{MIT Sloan Sports Analytics Conference}.
+  \item Gramacy, R.\ B., Jensen, S.\ T., \& Taddy, M.\ (2013). ``Estimating player contribution
+        in hockey with regularized logistic regression.'' \emph{Journal of Quantitative Analysis
+        in Sports}, 9(1).
+  \item MoneyPuck.com methodology notes: \url{https://moneypuck.com/about.htm}.
+        [GSAx definition; shot danger zone classification.]
+\end{itemize}
+
+\end{document}
