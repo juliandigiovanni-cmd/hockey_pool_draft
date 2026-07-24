@@ -288,26 +288,32 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
 
 ## Future milestones (not in scope for the 2026-27 rebuild)
 
-- **Observation weighting by games_played**: weight goalie training observations by
+Listed in priority order.
+
+- **P1 — Observation weighting by games_played**: weight goalie training observations by
   `min(GP, 40) / 40` to down-weight 1–5 start goalies who are pure noise. Requires threading
   a `sample_weight` optional parameter through `_fit_one()`, `train_and_select()`, and
   `train_all_vs_exclude_latest()` in `training.py`, and computing weights in goalie
-  `build_xy_for()`. Not yet implemented; safe default=None preserves current behavior for
-  all non-goalie callers.
-- **MultiTaskElasticNet for (GAA, save_pct)**: joint sparsity across the algebraically-linked
+  `build_xy_for()`. Safe default=None preserves current behavior for all non-goalie callers.
+  *Most impactful remaining modeling task for goalies.*
+- **P2 — MultiTaskElasticNet for (GAA, save_pct)**: joint sparsity across the algebraically-linked
   pair (r=−0.84); a feature is selected for both targets or neither. Use
-  `sklearn.linear_model.MultiTaskElasticNetCV`. Only worth implementing if observation
-  weighting doesn't suffice — the algebraic linkage already means single-target models share
-  most of their signal.
-- **Joint D-men model**: defenseman points mechanically raise their plus/minus (a scored goal
-  by definition is also a positive plus/minus event). Leakage and blending are now fixed;
-  true multi-output regression (predicting plus_minus residual after accounting for point
-  contributions) remains future work.
-- **Majority-team for historical traded players**: game logs currently cover only the most
-  recent season. Expanding to full history (one API call per player per historical season)
-  would allow assigning each player to the team they played most games for in each historical
-  season, rather than defaulting to the first team listed.
-- **Interactive draft-day tool**: analyze and select players live during the draft. Lowest
+  `sklearn.linear_model.MultiTaskElasticNetCV`. Only worth implementing if P1 doesn't suffice —
+  the algebraic linkage already means single-target models share most of their signal.
+- **P3 — Joint D-men model**: defenseman points mechanically raise their plus/minus (a scored goal
+  is also a +1 event). Leakage and blending are now fixed; true multi-output regression (predicting
+  plus_minus residual after accounting for point contributions) remains future work. Medium effort;
+  primarily affects depth D-men where team-driven vs. personal contribution is most ambiguous.
+- **P4 — GP diagnostic Layer 2 (game-log debut-date confirmation)**: for any player whose debut
+  season has GP < 50, fetch the game log via the existing `get_player_game_log()` endpoint and
+  check `min(gameDate)`. A first game after February 1 is definitively a late call-up rather than
+  injury. Deferred because the GP < 25 threshold filter already handles all known cases; implement
+  if edge cases emerge from `gp_projection_check.csv`.
+- **P5 — Majority-team for historical traded players**: game logs currently cover only the most
+  recent season. Expanding to full history (one API call per player per historical season) would
+  assign each player to the team they played most games for, making team-context lag features more
+  accurate for the ~5–10% of rows involving mid-season trades. High API cost for marginal gain.
+- **P6 — Interactive draft-day tool**: analyze and select players live during the draft. Lowest
   priority per original spec; nothing built yet.
 - **2027-28 season**: copy `2026-27/config.yaml` → `2027-28/config.yaml`, update
   season/trade-override/roster-date fields, run `--stage all`. That's the full annual process.
