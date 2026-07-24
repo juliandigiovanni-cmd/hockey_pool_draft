@@ -1,11 +1,9 @@
 """Defense model: dual target (points/game and plus-minus/game) with independent pipelines.
 
-DELIBERATE, DOCUMENTED LEAKAGE TRADEOFF (preserved from legacy v1.4): the points model is
-strictly lagged, but the plus/minus model is allowed to use *contemporaneous team* context
-(current-season team goals-for/against, goal differential, team-strength flags). Plus/minus is
-far harder to predict from lagged individual data alone, and a defenseman's plus/minus is
-mechanically tied to how his team does that same season. Individual current-season stats are
-still excluded from both models — only team context is opened up, and only for plus/minus.
+Both models use strictly lagged features only. The previous version allowed contemporaneous
+team context for plus/minus, but those features are NaN→0 at prediction time (future season
+not played yet), causing a systematic train/predict mismatch. Career averages for plus_minus
+are added instead (more stable signal than any single-year lag given autocorr r≈0.279).
 
 Pool scoring for defense is goals + assists + net plus/minus.
 """
@@ -60,6 +58,7 @@ def engineer(df: pd.DataFrame, cfg: SeasonConfig) -> pd.DataFrame:
     df = fe.join_moneypuck(df, cfg, "skaters")
     lags = fe.lag_feature_list(df, _INDIVIDUAL)
     df = fe.create_lag_features(df, lags, cfg.lag_years, fe.resolve_min_training_year(df, cfg))
+    df = fe.add_career_averages(df, ["plus_minus", "plus_minus_per_game"])
     df = fe.engineer_features(df, cfg.lag_years,
                               interaction_metrics=("plus_minus_per_game", "points_per_game", "time_on_ice_per_game"),
                               covid_metrics=("plus_minus_per_game", "points_per_game"))
@@ -67,7 +66,7 @@ def engineer(df: pd.DataFrame, cfg: SeasonConfig) -> pd.DataFrame:
 
 
 def build_xy_for(df: pd.DataFrame, target: str):
-    allow_team = target == "plus_minus"  # the documented tradeoff
+    allow_team = False  # contemporaneous team stats are NaN at prediction time; lagged proxies remain
     cols = fe.select_feature_columns(df, _TARGET_COLS, allow_contemporaneous_team=allow_team)
     X, y = fe.build_xy(df, cols, TARGETS[target])
     return X, y, df.loc[X.index, "year"]

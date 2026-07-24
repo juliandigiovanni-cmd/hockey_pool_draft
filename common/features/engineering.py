@@ -8,9 +8,9 @@ Leakage model (important): instead of the legacy denylist that tried to enumerat
 contemporaneous column to drop, feature selection here is an *allowlist* — a column is only
 eligible as a predictor if it is lagged, a known pre-season control (COVID indicators), or an
 engineered feature derived from lagged data. Nothing contemporaneous can slip through by being
-forgotten. The one deliberate exception is `allow_contemporaneous_team=True`, used by the
-defense plus/minus model (see common/models/defense.py) which is documented as intentionally
-allowed to see current-season *team* context. Individual current-season stats are never allowed.
+forgotten. `allow_contemporaneous_team=True` exists for callers that explicitly need current-
+season team context, but all position models now pass False — contemporaneous team stats are
+NaN at prediction time. Individual current-season stats are never allowed.
 """
 
 from __future__ import annotations
@@ -47,7 +47,8 @@ DERIVED_TEAM_COLS = [
 
 # Substrings marking a column as an engineered-from-lag feature (always allowlisted).
 _ENGINEERED_MARKERS = ("_x_", "_hist_avg", "_hist_std", "_trend", "_per_game_lag",
-                       "rel_team", "teammate", "normalized_team", "_performance")
+                       "rel_team", "teammate", "normalized_team", "_performance",
+                       "_career_avg")
 
 _EXPERIENCE_LAG_BASE = ["years_played", "years_played_squared", "years_played_cubed"]
 
@@ -168,6 +169,22 @@ def create_lag_features(df: pd.DataFrame, lag_features: list[str], lag_years: in
             new_cols[f"{feature}_lag{lag}"] = g[feature].shift(lag)
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df[df["year"] >= min_training_year].copy()
+
+
+def add_career_averages(df: pd.DataFrame, stat_cols: list[str]) -> pd.DataFrame:
+    """Expanding mean of each stat over all prior seasons (leakage-safe via shift(1)).
+
+    Produces {col}_career_avg for each col in stat_cols that exists in df. Useful for
+    high-variance rate stats (goalie save_pct, GAA; D-men plus_minus) where a career
+    average is more stable than any single-year lag.
+    """
+    df = df.sort_values(["player_id", "year"]).copy()
+    for col in [c for c in stat_cols if c in df.columns]:
+        df[f"{col}_career_avg"] = (
+            df.groupby("player_id", sort=False)[col]
+              .transform(lambda x: x.shift(1).expanding().mean())
+        )
+    return df
 
 
 def engineer_features(df: pd.DataFrame, lag_years: int,

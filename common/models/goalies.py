@@ -57,26 +57,35 @@ def engineer(df: pd.DataFrame, cfg: SeasonConfig) -> pd.DataFrame:
     df = fe.join_moneypuck(df, cfg, "goalies")
     lags = fe.lag_feature_list(df, _INDIVIDUAL)
     df = fe.create_lag_features(df, lags, cfg.lag_years, fe.resolve_min_training_year(df, cfg))
+    df = fe.add_career_averages(df, ["save_pct", "goals_against_avg", "shutouts",
+                                     "wins_per_game", "save_percentage", "goals_against_average",
+                                     "shutouts_per_game"])
     return fe.engineer_features(df, cfg.lag_years,
                                 interaction_metrics=("wins_per_game", "save_pct", "goals_against_avg", "shutouts"),
                                 covid_metrics=("wins_per_game", "save_pct"))
 
 
 def build_xy_for(df: pd.DataFrame, target: str, cfg: SeasonConfig):
-    frame = df[df["games_played_player"] >= _min_gp(cfg)] if target in QUALIFIED_ONLY else df
+    frame = df
     cols = fe.select_feature_columns(frame, _TARGET_COLS, allow_contemporaneous_team=False)
     X, y = fe.build_xy(frame, cols, TARGETS[target],
                        core_lag_prefixes=("wins_player_lag", "games_played_player_lag"))
     return X, y, frame.loc[X.index, "year"]
 
 
+_LINEAR_ONLY = ("ridge", "lasso", "elastic_net")
+
+
 def train(df_raw: pd.DataFrame, cfg: SeasonConfig, persist: bool = True) -> dict:
     eng = engineer(df_raw, cfg)
     out = {}
     for target in TARGETS:
+        # Restrict GAA and save_pct to linear models: near-zero autocorr means tree models
+        # overfit badly on this data, while regularized linear models regress toward the mean.
+        kwargs = {"model_types": _LINEAR_ONLY} if target in QUALIFIED_ONLY else {}
         try:
             res = tr.train_all_vs_exclude_latest(
-                lambda f, t=target: build_xy_for(f, t, cfg), eng, target, cfg)
+                lambda f, t=target: build_xy_for(f, t, cfg), eng, target, cfg, **kwargs)
         except (ValueError, RuntimeError) as e:
             out[target] = {"model": None, "error": str(e)}
             continue
