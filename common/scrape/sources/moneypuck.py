@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 import shutil
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -40,17 +41,28 @@ _HEADERS = {
 }
 
 
-def fetch_season_summary(start_year: int, entity: str, game_type: str = "regular") -> pd.DataFrame:
+def fetch_season_summary(start_year: int, entity: str, game_type: str = "regular",
+                         _retry_delay: float = 15.0) -> pd.DataFrame:
     url = f"{BASE_URL}/{start_year}/{game_type}/{entity}.csv"
-    try:
-        resp = requests.get(url, headers=_HEADERS, timeout=30)
-        resp.raise_for_status()
-        df = pd.read_csv(io.StringIO(resp.text))
-    except Exception as e:
-        logger.error(f"Failed to fetch MoneyPuck {entity} for {start_year}: {e}")
-        return pd.DataFrame()
-    df["season_start_year"] = start_year
-    return df
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=30)
+            if resp.status_code == 429:
+                if attempt == 0:
+                    logger.warning(f"MoneyPuck rate-limited for {entity}/{start_year}; retrying after {_retry_delay}s")
+                    time.sleep(_retry_delay)
+                    continue
+                logger.error(f"MoneyPuck rate-limited for {entity}/{start_year} after retry; skipping")
+                return pd.DataFrame()
+            resp.raise_for_status()
+            df = pd.read_csv(io.StringIO(resp.text))
+        except Exception as e:
+            logger.error(f"Failed to fetch MoneyPuck {entity} for {start_year}: {e}")
+            return pd.DataFrame()
+        df = df.copy()
+        df["season_start_year"] = start_year
+        return df
+    return pd.DataFrame()
 
 
 def _existing_years(path: Path) -> set[int]:
@@ -94,7 +106,13 @@ def update_moneypuck_data(cfg: SeasonConfig) -> None:
             continue
 
         logger.info(f"Fetching MoneyPuck {entity} for years {missing_years}")
-        new_frames = [f for f in (fetch_season_summary(y, entity) for y in missing_years) if not f.empty]
+        new_frames = []
+        for i, y in enumerate(missing_years):
+            if i > 0:
+                time.sleep(1.0)
+            f = fetch_season_summary(y, entity)
+            if not f.empty:
+                new_frames.append(f)
         if not new_frames:
             logger.warning(f"MoneyPuck {entity}: no years fetched successfully; skipping this entity")
             continue
@@ -106,3 +124,4 @@ def update_moneypuck_data(cfg: SeasonConfig) -> None:
             combined = new_df
         combined.to_csv(out_path, index=False)
         logger.info(f"Saved {len(combined):,} MoneyPuck {entity} rows to {out_path}")
+        time.sleep(3.0)  # brief pause between entities to avoid rate limits
