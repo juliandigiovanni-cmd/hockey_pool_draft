@@ -155,6 +155,21 @@ def compute_pool_points(cfg: SeasonConfig, fwd_df: pd.DataFrame, def_df: pd.Data
     return {"forward": fwd_df, "defense": def_df, "goalie": goal_df}
 
 
+# --------------------------------------------------------------------------- prediction blending
+
+def _blend(df: pd.DataFrame, pred_col: str, ref_col: str, alpha: float) -> pd.Series:
+    """Blend model prediction with a historical reference to reduce compression at extremes.
+
+    alpha = weight on model; (1-alpha) = weight on reference.
+    Calibrated from OOS concordance: alpha = 2*(concordance - 0.5).
+    Falls back to model prediction where the reference is NaN (new players).
+    """
+    if ref_col not in df.columns:
+        return df[pred_col]
+    blended = alpha * df[pred_col] + (1 - alpha) * df[ref_col]
+    return blended.fillna(df[pred_col])
+
+
 # --------------------------------------------------------------------------- outputs
 
 def _rank(df: pd.DataFrame, position: str) -> pd.DataFrame:
@@ -247,6 +262,15 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
     def_rows["pred_points_per_game"] = models["defense_points"].predict(def_rows)
     def_rows["pred_plus_minus_per_game"] = models["defense_plus_minus"].predict(def_rows)
     def_rows["projected_games"] = def_rows["player_id"].map(skater_gp_map).fillna(70)
+
+    # Blend model predictions with 2-year historical averages to correct compression at the top.
+    # Alpha weights derived from OOS concordance: alpha = 2*(concordance - 0.5).
+    #   defense_points OOS concordance ~0.72  → alpha=0.45 (model trusted, hist corrects compression)
+    #   defense_plus_minus OOS concordance ~0.54 → alpha=0.10 (model barely beats chance; hist dominates)
+    def_rows["pred_points_per_game"] = _blend(
+        def_rows, "pred_points_per_game", "points_per_game_hist_avg", alpha=0.45)
+    def_rows["pred_plus_minus_per_game"] = _blend(
+        def_rows, "pred_plus_minus_per_game", "plus_minus_per_game_hist_avg", alpha=0.10)
 
     # Goalies
     goal_rows = _predict_rows(goa.engineer, goalie_aug, cfg)
