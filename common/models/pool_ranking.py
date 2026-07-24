@@ -103,8 +103,9 @@ def _predict_rows(engineer_fn, aug_raw: pd.DataFrame, cfg: SeasonConfig) -> pd.D
     return apply_current_team_overrides(rows, cfg)
 
 
-def _goalie_projected_games(goalie_raw: pd.DataFrame, games_per_season: int, default: int = 20) -> dict:
-    df = fe.add_year(goalie_raw)
+def _projected_games(raw_df: pd.DataFrame, games_per_season: int, default: int) -> dict:
+    """3-year rolling average of games_played_player per player, capped at games_per_season."""
+    df = fe.add_year(raw_df)
     out = {}
     for pid, g in df.sort_values("year").groupby("player_id"):
         gp = pd.to_numeric(g["games_played_player"], errors="coerce").dropna().tail(3)
@@ -231,21 +232,24 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
     skater_aug = _augment_with_prediction_rows(skater, cfg)
     goalie_aug = _augment_with_prediction_rows(goalie, cfg)
 
+    # Per-player projected games: 3-year rolling avg of actual GP, capped at games_per_season
+    skater_gp_map = _projected_games(skater, cfg.games_per_season, default=70)
+    goalie_gp_map = _projected_games(goalie, cfg.games_per_season, default=20)
+
     # Forwards
     fwd_rows = _predict_rows(fwd.engineer, skater_aug, cfg)
     fwd_rows["pred_points_per_game"] = models["forward_points"].predict(fwd_rows)
-    fwd_rows["projected_games"] = cfg.games_per_season
+    fwd_rows["projected_games"] = fwd_rows["player_id"].map(skater_gp_map).fillna(70)
 
     # Defense
     def_rows = _predict_rows(dfe.engineer, skater_aug, cfg)
     def_rows["pred_points_per_game"] = models["defense_points"].predict(def_rows)
     def_rows["pred_plus_minus_per_game"] = models["defense_plus_minus"].predict(def_rows)
-    def_rows["projected_games"] = cfg.games_per_season
+    def_rows["projected_games"] = def_rows["player_id"].map(skater_gp_map).fillna(70)
 
     # Goalies
     goal_rows = _predict_rows(goa.engineer, goalie_aug, cfg)
-    gp_map = _goalie_projected_games(goalie, cfg.games_per_season)
-    goal_rows["projected_games"] = goal_rows["player_id"].map(gp_map).fillna(20)
+    goal_rows["projected_games"] = goal_rows["player_id"].map(goalie_gp_map).fillna(20)
     for target, col in [("wins", "pred_wins_per_game"), ("shutouts", "pred_shutouts_per_game"),
                         ("gaa", "pred_gaa"), ("save_pct", "pred_save_pct")]:
         m = models.get(f"goalie_{target}")
