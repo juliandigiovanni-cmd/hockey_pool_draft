@@ -676,17 +676,36 @@ Target & OOS Concordance & $\alpha$ & Interpretation \\
 
 \subsection{Projected games}
 
-Each player's projected games played is the 3-year rolling average of their actual
-\texttt{games\_played\_player}, capped at \texttt{cfg.games\_per\_season}:
+Each player's projected games played is derived from a 3-year rolling average of their actual
+\texttt{games\_played\_player}, capped at \texttt{cfg.games\_per\_season}.
+
+\textbf{Partial-season filter:} Historical seasons with GP $<$ 25 are excluded from the rolling
+window before computing the average. This prevents late-season rookie call-ups (e.g.\ a player
+who plays 15 games in their debut year after being recalled from the AHL in March) from biasing
+the projection downward. The most-recent season is \emph{always} included regardless of GP —
+a genuine recent injury should still reduce the projection.
 
 \begin{equation}
-  \text{GP}_i^{\text{proj}} = \min\!\left(\frac{1}{3}\sum_{k=1}^{3} \text{GP}_{i,t-k},\;
-  \texttt{games\_per\_season}\right)
+  \mathcal{H}_i = \{\text{GP}_{i,s} : s < t_{\max},\; \text{GP}_{i,s} \geq 25\}
+  \quad\text{(filtered historical seasons)}
+\end{equation}
+\begin{equation}
+  \text{GP}_i^{\text{proj}} = \min\!\left(\frac{1}{|\mathcal{W}_i|}\sum_{s \in \mathcal{W}_i}
+  \text{GP}_{i,s},\; \texttt{games\_per\_season}\right),
+  \quad \mathcal{W}_i = (\mathcal{H}_i \cup \{\text{GP}_{i,t_{\max}}\})\text{ tail-3}
 \end{equation}
 
-For players with no recent history: forwards and defense default to 70 games; goalies default
-to 20 games. This reflects injury risk and roster uncertainty rather than assuming a full
-84-game season for everyone.
+For players with no qualifying history: forwards and defense default to 70 games; goalies default
+to 20 games.
+
+\textbf{GP-projection diagnostic:} On every predict run, a diagnostic compares each player's
+projected GP to their most-recent actual GP. Players where
+$\text{GP}^{\text{proj}}_i < 0.70 \times \text{GP}^{\text{last}}_i$
+are logged as anomalies and written to \texttt{results/diagnostics/gp\_projection\_check.csv}
+(all players sorted by ratio, with columns: player\_id, player\_name, position\_group,
+projected\_games, last\_season\_gp, ratio). After the partial-season fix, only 13 players
+remain flagged — all with genuinely irregular career patterns (multi-season injuries,
+suspensions, retirements) rather than call-up artifacts.
 
 \subsection{Dual scoring outputs}
 
@@ -756,6 +775,11 @@ Model diagnostics are generated automatically at the end of every \texttt{--stag
   \item[\texttt{plots/diagnostics/rolling\_oos\_all.png}]
         Grid of OOS $R^2$ by holdout year for each model (one subplot per model). Shows whether
         model quality has been stable over time or has degraded in recent seasons.
+  \item[\texttt{results/diagnostics/gp\_projection\_check.csv}]
+        All players sorted by $\text{GP}^{\text{proj}} / \text{GP}^{\text{last}}$. Players
+        below 0.70 are flagged in the log as anomalies requiring manual review before draft day.
+        Produced by \texttt{pool\_ranking.\_write\_gp\_diagnostic()}.
+
   \item[\texttt{results/diagnostics/source\_reconciliation.csv}]
         NHL API vs.\ MoneyPuck agreement on counting stats. Produced by
         \texttt{common/diagnostics/reconcile.py}.
@@ -888,6 +912,16 @@ Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked
 % ===========================================================================
 
 \begin{description}[leftmargin=3cm, style=nextline]
+
+  \item[GP diagnostic Layer 2: game-log debut date]
+        The current partial-season filter (GP $<$ 25) works on the aggregate season count. A
+        richer signal is already available: \texttt{nhl\_game\_logs.csv} contains
+        \texttt{gameDate} in ISO format; the existing \texttt{get\_player\_game\_log()} endpoint
+        in \texttt{nhl\_api.py} can fetch any player/season combination. For any player whose
+        debut season has GP $<$ 50, fetching their game log and checking the first game date
+        would definitively distinguish a March call-up (first game after February) from an
+        October injury (first game in November). Deferred because the threshold filter handles
+        the known cases; implement if edge cases emerge.
 
   \item[Observation weighting]
         Thread \texttt{sample\_weight} through \texttt{\_fit\_one()},

@@ -258,6 +258,19 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
   - Both `pool_points` (per-player projected GP) and `pool_points_full_season` appear in all
     output CSVs, so the user can compare injury-risk-adjusted vs pure-value rankings side by side.
 
+- **2026-07-24 — Fix downward GP bias for late-season rookie call-ups; add GP diagnostic** (commit f7fe145):
+  - Root cause: `_projected_games()` included all seasons in the 3-year rolling average.
+    A player like Lane Hutson with a 15-game debut call-up followed by full seasons was projected
+    at ~60 games instead of ~82 — the partial debut season dragged the average down.
+  - Fix: historical seasons with GP < 25 are now excluded from the rolling window; the most-recent
+    season is always included regardless of GP so genuine injury risk still reduces the projection.
+    Lane Hutson confirmed fixed: proj=82 (ratio=1.0 vs last season). No external data sources needed.
+  - Added `_last_season_gp()` helper and `_write_gp_diagnostic()` to `pool_ranking.py`.
+    On every `--stage predict` run: logs any player where `projected_games < 70% of last_season_gp`
+    and writes `results/diagnostics/gp_projection_check.csv` (all 3,397 players sorted by ratio).
+  - Result: 13 players remain flagged — all genuine irregular-career cases (suspensions, injury
+    history, retirements) rather than residual call-up artifacts. Useful pre-draft review list.
+
 - **2026-07-24 — Defense prediction blending** (commit 7525bd2):
   - Diagnosed two root causes of elite D-men ranking too low: (1) gradient boosting compresses
     top-end predictions — e.g. Makar's lag1 points/game = 1.053, but the model predicted 0.762;
