@@ -23,6 +23,9 @@ common/            shared package, reused every season
     training.py        shared train/tune/evaluate harness (one implementation, not per-position copies)
     forwards.py / defense.py / goalies.py   per-position target + feature configs
     pool_ranking.py    unified scoring step, consumes the persisted tuned models
+  diagnostics/
+    reconcile.py       cross-source stat comparison (NHL API vs MoneyPuck counting stats)
+    model_report.py    model fit diagnostics: metrics table, PvA plots, baseline R², rolling OOS
   pipeline.py          stage functions: scrape / clean / train / predict
 
 run_season.py       CLI entry point: python run_season.py --season 2026-27 --stage all|scrape|clean|train|predict
@@ -33,6 +36,8 @@ run_season.py       CLI entry point: python run_season.py --season 2026-27 --sta
   models/                persisted joblib model artifacts (gitignored)
   results/               rankings/reports csv/xlsx/txt (gitignored)
   plots/                 diagnostics (gitignored)
+  results/diagnostics/   source_reconciliation.csv, model_metrics.csv
+  plots/diagnostics/     pva_*.png (predicted-vs-actual + residuals per model)
 ```
 
 `2025-26/` is last year's original ad-hoc build (24 near-duplicate model scripts, no shared
@@ -49,6 +54,28 @@ season's `config.yaml` under `scoring:`.
 - Goalies (min 40 GP to qualify for bonuses): 1 pt/win, 3 pts total for a shutout win
   (not additive on top of the win point), +10 for best GAA among qualified goalies,
   +10 for best save % among qualified goalies
+
+## Known modeling limitations (as of 2026-07-24)
+
+- **Goalie GAA and save%**: OOS R² < 0, meaning the model predicts *worse* than predicting
+  the training-set mean. These targets are fundamentally hard to predict from prior seasons;
+  season-to-season goalie stats have high variance and low autocorrelation. In the pool,
+  the bonus scoring only needs the argmax/argmin among 40+ GP qualifiers — the bonus is
+  awarded to whoever scores highest/lowest, so even a weak model's ranking at the top is
+  informative. But this should be revisited: consider predicting the percentile rank rather
+  than the raw stat, or switching to a simpler "stability-weighted career average" baseline.
+- **Defense plus/minus OOS R²=0.031**: essentially random out-of-sample. The contemporaneous
+  team-context features (allowed for this target) don't help for future-season prediction
+  because team composition changes. The model is useful only insofar as it captures some
+  signal from lagged team quality. Worth exploring a joint points+plus/minus model (see Future).
+- **Traded players — team context**: players who changed teams during a historical season are
+  assigned the *first* team listed in the NHL API's comma-joined `team_abbrev`. Their season
+  totals (goals, assists, games_played) are preserved correctly; only the team-context features
+  (used mainly by the defense plus/minus model) may be inaccurate. Per-team game logs are only
+  available for the most recent season, so a majority-team fix across all 18 training seasons
+  would require expanding game-log history (one API call per player per historical season).
+- **Pool scoring rules are constant**: no year-to-year variation in the scoring system, so
+  no time-varying config is needed.
 
 ## Known modeling tradeoffs (carried over deliberately, not bugs)
 
@@ -70,14 +97,19 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
   recent season only — a full historical backfill would mean one API call per player per
   season across 2008-2025 for marginal benefit over the existing season-level lag features)
   for rolling-form features, and current-team rosters (see `rosters.py` above).
-- **MoneyPuck** (`common/scrape/sources/moneypuck.py`) — added, but **unreachable in practice
-  so far** (2026-07-23): every request gets an immediate `Connection reset by peer`, both from
-  the dev sandbox and from the user's real machine. Tried switching from bare `pd.read_csv(url)`
-  to `requests` with a browser-like User-Agent (a classic Cloudflare bot-check fix) — made no
-  difference, so this looks like a network-level block (firewall/ASN/IP), not a bot-UA check.
-  The scrape stage degrades gracefully when this happens (logs a warning, skips MoneyPuck,
-  continues to clean/train/predict) rather than failing the run. Revisit if/when reachable from
-  a different network, or drop it in favor of Natural Stat Trick if it stays blocked.
+- **MoneyPuck** (`common/scrape/sources/moneypuck.py`) — **now working (2026-07-24)**.
+  Previous block was network/ASN-level (not a bot-UA check); resolved by switching networks.
+  All 18 seasons (2008–2025) fetched successfully: 81,355 skater rows, 8,510 goalie rows.
+  Provides xG, shot-quality (high/medium/low danger), gameScore, and goalie GSAx features
+  unavailable from the NHL API. Features are joined at the feature-engineering step and lagged
+  before use (no leakage). Join key: `playerId` integer (same integer in both sources) + season
+  start year — match rate ~94.5%. Remaining ~5.5% unmatched are fringe players with very few
+  games, genuinely absent from MoneyPuck's data. Rate-limit handling added: 1s between year
+  fetches, 3s between entities, 15s retry on 429.
+  Data confirmed regular-season only: scraper uses `/regular/` in the URL path; MoneyPuck's
+  `situation=="all"` aggregate row correctly sums across all regular-season game situations.
+  Cross-source reconciliation (see `source_reconciliation.csv`) confirms near-perfect agreement
+  with NHL API counting stats: Pearson r ≥ 0.9999 for goals, assists, points, games_played.
 - **Natural Stat Trick** — skipped for now. Free, but requires requesting a manually-approved
   access key before automated pulls work, and its stats mostly overlap MoneyPuck's. Revisit
   only if MoneyPuck's feature set proves insufficient.
@@ -149,6 +181,46 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
   Re-ran `--stage predict` (reusing persisted models, no retrain needed) to refresh
   `2026-27/results/` with 84-game projections.
 
+- **2026-07-24 — MoneyPuck integration complete**:
+  - Network block resolved (different network). All 18 seasons fetched for skaters/goalies/teams.
+  - Rate-limit handling added to scraper (1s inter-year, 3s inter-entity, 15s retry on 429).
+  - MoneyPuck join switched from name-matching to player_id (exact integer, same in both sources):
+    match rate 93% → 94.5%; remaining 5.5% genuinely absent from MoneyPuck's records.
+  - Cross-source reconciliation script added (`common/diagnostics/reconcile.py`): NHL API and
+    MoneyPuck agree at Pearson r ≥ 0.9999 on goals, assists, points, games_played. The few
+    games_played outliers (e.g. Seth vs Caleb Jones in the same season) trace to historical
+    surname collisions in MoneyPuck, not real data errors — the player_id join prevents these
+    from affecting the model.
+  - Data confirmed regular-season only: `/regular/` URL path + `situation=="all"` filter.
+  - Re-ran `--stage predict` with xG features flowing into models for the first time.
+
+- **2026-07-24 — Model diagnostics module added** (`common/diagnostics/model_report.py`):
+  - `TrainedModel` now stores `y_test`/`y_pred_test` (persisted in joblib), so predicted-vs-actual
+    plots are available on `--stage predict` without retraining.
+  - `baseline_r2` added to every model's metrics: predict using training-set mean; any model
+    with R² < baseline_r2 is flagged as `beats_baseline=False`.
+  - Metrics table written to `results/diagnostics/model_metrics.csv` on every predict run.
+  - Predicted-vs-actual + residual plots written to `plots/diagnostics/pva_*.png`.
+  - `rolling_oos_eval()` added to `training.py` for gold-standard time-series OOS (train on
+    years prior to holdout, predict holdout year); call with `--rolling-eval` when needed.
+  - Key findings from first full diagnostic run: forward_points OOS R²=0.665 (healthy);
+    defense_plus_minus OOS R²=0.031; goalie GAA OOS R²=-0.203, goalie Sv% OOS R²=-0.839
+    (both worse than predicting the mean — flagged in the metrics table).
+
 ## Future milestones (not in scope for the 2026-27 rebuild)
 
-- Interactive tool for analyzing and selecting players dynamically live during the draft.
+- **Joint D-men model**: defenseman points directly contribute to team goals-for, which
+  mechanically increases plus/minus. Worth exploring multi-output regression or predicting
+  plus/minus residual after accounting for point contributions.
+- **Goalie model improvement**: season-to-season save% and GAA have low predictability.
+  Candidates: percentile-rank prediction instead of raw stat, stability-weighted career
+  average baseline, Bayesian shrinkage toward league mean, or new features (save% by
+  shot type from MoneyPuck high/medium/low danger breakdowns).
+- **Majority-team for historical traded players**: game logs currently cover only the most
+  recent season. Expanding to full history (one API call per player per historical season)
+  would allow assigning each player to the team they played most games for in each historical
+  season, rather than defaulting to the first listed team.
+- **Interactive draft-day tool**: analyze and select players live during the draft. Lowest
+  priority per original spec; nothing built yet.
+- **2027-28 season**: copy `2026-27/config.yaml` → `2027-28/config.yaml`, update
+  season/trade-override/roster-date fields, run `--stage all`. That's the full annual process.
