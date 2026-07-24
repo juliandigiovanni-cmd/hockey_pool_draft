@@ -63,6 +63,10 @@ def metrics_table(models: dict[str, TrainedModel | None],
             "rmse": round(met.get("rmse", float("nan")), 4),
             "cv_mean": round(met.get("cv_mean", float("nan")), 4),
         }
+        # In-sample holdout ranking metrics
+        for mk in ("spearman_r", "concordance", "directional_acc", "bias"):
+            row[mk] = round(met.get(mk, float("nan")), 4)
+
         val = validations.get(key)
         if val and val.get("oos"):
             oos = val["oos"]
@@ -70,8 +74,15 @@ def metrics_table(models: dict[str, TrainedModel | None],
             row["oos_mae"] = round(oos.get("mae", float("nan")), 4)
             row["oos_n"] = oos.get("n")
             row["oos_chosen_model"] = val.get("chosen", "")
+            for mk in ("spearman_r", "concordance", "directional_acc", "bias"):
+                row[f"oos_{mk}"] = round(oos.get(mk, float("nan")), 4)
+            row["oos_top1_match_max"] = oos.get("top1_match_max")
+            row["oos_top1_match_min"] = oos.get("top1_match_min")
         else:
-            row["oos_r2"] = row["oos_mae"] = row["oos_n"] = row["oos_chosen_model"] = None
+            for col in ("oos_r2", "oos_mae", "oos_n", "oos_chosen_model",
+                        "oos_spearman_r", "oos_concordance", "oos_directional_acc",
+                        "oos_bias", "oos_top1_match_max", "oos_top1_match_min"):
+                row[col] = None
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -83,7 +94,9 @@ def metrics_table(models: dict[str, TrainedModel | None],
 
     # Print a compact summary to stdout
     print("\n=== Model fit summary ===")
-    cols = ["label", "algorithm", "test_r2", "baseline_r2", "beats_baseline", "mae", "rmse", "oos_r2"]
+    cols = ["label", "algorithm", "test_r2", "baseline_r2", "beats_baseline",
+            "spearman_r", "concordance", "directional_acc",
+            "oos_r2", "oos_spearman_r", "oos_concordance"]
     print_cols = [c for c in cols if c in df.columns]
     print(df[print_cols].to_string(index=False))
     return df

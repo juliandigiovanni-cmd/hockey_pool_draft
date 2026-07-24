@@ -11,6 +11,7 @@ qualified goalies (applied in pool_ranking, not here).
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from common.config import SeasonConfig
@@ -27,7 +28,8 @@ _INDIVIDUAL = ["wins_player", "losses_player", "ot_losses_player", "shutouts",
                "goals_against_player", "goals_against_avg", "save_pct", "saves", "shots_against",
                "games_played_player", "games_started", "time_on_ice",
                "wins_per_game", "shutouts_per_game", "goals_against_average", "save_percentage",
-               "total_wins", "total_shutouts"] + fe.DERIVED_TEAM_COLS
+               "total_wins", "total_shutouts",
+               "eb_save_pct", "gsax", "hd_shot_pct"] + fe.DERIVED_TEAM_COLS
 
 
 def _min_gp(cfg: SeasonConfig) -> int:
@@ -54,12 +56,21 @@ def engineer(df: pd.DataFrame, cfg: SeasonConfig) -> pd.DataFrame:
     df = fe.add_years_played(df, prime_range=(3, 12))
     df = fe.add_team_goal_differential(df)
     df = fe.clean_common_columns(df, toi_default=0.0)
+    df = fe.add_eb_save_pct(df)
     df = fe.join_moneypuck(df, cfg, "goalies")
+    # GSAx: expected goals against − actual; positive = goalie outperformed shot difficulty
+    if "mp_xGoals" in df.columns and "goals_against_player" in df.columns:
+        df["gsax"] = (pd.to_numeric(df["mp_xGoals"], errors="coerce")
+                      - pd.to_numeric(df["goals_against_player"], errors="coerce"))
+    # High-danger shot fraction: controls for shot mix the team's defense allowed
+    if "mp_highDangerShots" in df.columns and "shots_against" in df.columns:
+        df["hd_shot_pct"] = (pd.to_numeric(df["mp_highDangerShots"], errors="coerce")
+                             / pd.to_numeric(df["shots_against"], errors="coerce").replace(0, np.nan))
     lags = fe.lag_feature_list(df, _INDIVIDUAL)
     df = fe.create_lag_features(df, lags, cfg.lag_years, fe.resolve_min_training_year(df, cfg))
     df = fe.add_career_averages(df, ["save_pct", "goals_against_avg", "shutouts",
                                      "wins_per_game", "save_percentage", "goals_against_average",
-                                     "shutouts_per_game"])
+                                     "shutouts_per_game", "eb_save_pct", "gsax"])
     return fe.engineer_features(df, cfg.lag_years,
                                 interaction_metrics=("wins_per_game", "save_pct", "goals_against_avg", "shutouts"),
                                 covid_metrics=("wins_per_game", "save_pct"))

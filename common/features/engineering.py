@@ -171,6 +171,34 @@ def create_lag_features(df: pd.DataFrame, lag_features: list[str], lag_years: in
     return df[df["year"] >= min_training_year].copy()
 
 
+def add_eb_save_pct(df: pd.DataFrame) -> pd.DataFrame:
+    """Empirical Bayes shrinkage of save_pct toward the league mean, weighted by shots faced.
+
+    Fits Beta(alpha, beta) from the historical distribution via method of moments on seasons
+    with >= 100 shots, then produces eb_save_pct = (alpha + saves) / (alpha + beta + shots).
+    Shrinks backups (few shots → aggressive toward league mean) and trusts starters (many shots
+    → close to observed). This is the sports-analytics community standard for noisy binomial
+    proportions (Thomas 2006; Robinson 2017). Must be called before create_lag_features so the
+    lagged eb_save_pct_lag* columns are created automatically.
+    """
+    df = df.copy()
+    shots = pd.to_numeric(df.get("shots_against", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    saves = pd.to_numeric(df.get("saves", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    raw_sv = (saves / shots.replace(0, np.nan)).clip(0.5, 1.0)
+    qual = raw_sv[shots >= 100].dropna()
+    if len(qual) >= 30:
+        mu, var = qual.mean(), qual.var()
+        if var > 0:
+            alpha = mu * (mu * (1 - mu) / var - 1)
+            beta_p = alpha * (1 - mu) / mu
+        else:
+            alpha, beta_p = 85.0, 8.5  # fallback: Beta centered at 0.909
+    else:
+        alpha, beta_p = 85.0, 8.5
+    df["eb_save_pct"] = (alpha + saves) / (alpha + beta_p + shots)
+    return df
+
+
 def add_career_averages(df: pd.DataFrame, stat_cols: list[str]) -> pd.DataFrame:
     """Expanding mean of each stat over all prior seasons (leakage-safe via shift(1)).
 

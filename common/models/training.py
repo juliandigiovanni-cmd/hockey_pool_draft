@@ -20,6 +20,7 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.stats import kendalltau, spearmanr
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.linear_model import ElasticNet, Lasso, Ridge
@@ -87,6 +88,27 @@ def selection_score(metrics: dict) -> float:
     return metrics["r2"] - 0.1 * metrics["overfitting_ratio"]
 
 
+def rank_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Ranking and directional accuracy metrics, applicable to all positions.
+
+    R² near zero doesn't mean the model has no ranking value — these metrics measure
+    whether the model correctly orders players, which is the actual pool draft objective.
+    """
+    if len(y_true) < 5 or np.std(y_pred) == 0:
+        # Constant predictor (e.g. Lasso zeroed all coefficients): rank metrics are undefined
+        return {"spearman_r": float("nan"), "concordance": float("nan"),
+                "directional_acc": float("nan"), "bias": float((y_pred - y_true).mean())}
+    sr = spearmanr(y_true, y_pred).statistic
+    tau, _ = kendalltau(y_true, y_pred)
+    dir_acc = float(np.mean(np.sign(y_pred - y_pred.mean()) == np.sign(y_true - y_true.mean())))
+    return {
+        "spearman_r": float(sr),
+        "concordance": float((tau + 1) / 2),
+        "directional_acc": dir_acc,
+        "bias": float((y_pred - y_true).mean()),
+    }
+
+
 def _make_cv(n: int, time_order: np.ndarray | None):
     folds = min(5, max(3, n // 30))
     if time_order is not None:
@@ -138,6 +160,7 @@ def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndar
         "rmse": float(np.sqrt(mean_squared_error(y_te, y_pred))),
         "cv_mean": search.best_score_, "n_train": len(X_tr), "n_test": len(X_te),
         "baseline_r2": r2_score(y_te, baseline_pred),
+        **rank_metrics(np.asarray(y_te), y_pred),
     }
     return {"estimator": est, "scaler": scaler, "best_params": search.best_params_,
             "metrics": metrics, "y_test": np.asarray(y_te), "y_pred_test": y_pred}
@@ -234,8 +257,15 @@ def train_all_vs_exclude_latest(build_xy_fn, df: pd.DataFrame, target: str, cfg:
         X_oos, y_oos, _ = build_xy_fn(df[df["year"] == latest])
         if len(X_oos) > 0:
             pred = model_ex.predict(X_oos)
-            out["oos"] = {"r2": r2_score(y_oos, pred) if len(y_oos) > 1 else float("nan"),
-                          "mae": mean_absolute_error(y_oos, pred), "n": len(y_oos)}
+            y_arr, p_arr = np.asarray(y_oos), pred
+            oos_met = {"r2": r2_score(y_arr, p_arr) if len(y_arr) > 1 else float("nan"),
+                       "mae": mean_absolute_error(y_arr, p_arr), "n": len(y_arr),
+                       **rank_metrics(y_arr, p_arr)}
+            # top1_match: does the model's argmax/argmin match the actual? (1 = correct)
+            if len(y_arr) >= 3:
+                oos_met["top1_match_max"] = int(p_arr.argmax() == y_arr.argmax())
+                oos_met["top1_match_min"] = int(p_arr.argmin() == y_arr.argmin())
+            out["oos"] = oos_met
 
     # Prefer all-data model unless the held-out model scored better on its own selection metric.
     ex = out["exclude_latest"]
