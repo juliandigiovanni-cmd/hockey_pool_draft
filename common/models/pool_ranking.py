@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 from common.config import SeasonConfig
+from common.diagnostics.model_report import generate_diagnostics
 from common.features import engineering as fe
 from common.models import defense as dfe
 from common.models import forwards as fwd
@@ -255,4 +256,5 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
 
     _write_outputs(cfg, ranked, validations, models)
     _write_plots(cfg, models)
+    generate_diagnostics(models, validations, cfg)
     return ranked

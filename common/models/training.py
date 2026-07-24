@@ -72,6 +72,8 @@ class TrainedModel:
     scaler: Any | None
     metrics: dict
     best_params: dict = field(default_factory=dict)
+    y_test: np.ndarray | None = None       # held-out actuals from training split (for diagnostics)
+    y_pred_test: np.ndarray | None = None  # corresponding predictions
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
         Xs = X.reindex(columns=self.selected_features).apply(pd.to_numeric, errors="coerce").fillna(0)
@@ -128,14 +130,17 @@ def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndar
     y_pred = est.predict(X_te)
     train_r2 = est.score(X_tr, y_tr)
     test_r2 = r2_score(y_te, y_pred)
+    baseline_pred = np.full(len(y_te), float(y_tr.mean()))
     metrics = {
         "r2": test_r2, "train_r2": train_r2,
         "overfitting_ratio": (train_r2 - test_r2) / train_r2 if train_r2 > 0 else 0.0,
         "mae": mean_absolute_error(y_te, y_pred),
         "rmse": float(np.sqrt(mean_squared_error(y_te, y_pred))),
         "cv_mean": search.best_score_, "n_train": len(X_tr), "n_test": len(X_te),
+        "baseline_r2": r2_score(y_te, baseline_pred),
     }
-    return {"estimator": est, "scaler": scaler, "best_params": search.best_params_, "metrics": metrics}
+    return {"estimator": est, "scaler": scaler, "best_params": search.best_params_,
+            "metrics": metrics, "y_test": np.asarray(y_te), "y_pred_test": y_pred}
 
 
 def train_and_select(X: pd.DataFrame, y: pd.Series, target: str,
@@ -176,7 +181,8 @@ def train_and_select(X: pd.DataFrame, y: pd.Series, target: str,
     logger.info("Selected %s for target %s (score=%.3f)", mt, target, best[0])
     return TrainedModel(target=target, model_type=mt, estimator=res["estimator"],
                         selected_features=features, scaler=res["scaler"],
-                        metrics=res["metrics"], best_params=res["best_params"])
+                        metrics=res["metrics"], best_params=res["best_params"],
+                        y_test=res.get("y_test"), y_pred_test=res.get("y_pred_test"))
 
 
 def feature_importance(tm: TrainedModel) -> pd.DataFrame:
@@ -240,3 +246,45 @@ def train_all_vs_exclude_latest(build_xy_fn, df: pd.DataFrame, target: str, cfg:
         out["chosen"] = "all"
         out["model"] = model_all
     return out
+
+
+def rolling_oos_eval(build_xy_fn, df: pd.DataFrame, target: str, cfg: SeasonConfig,
+                     min_train_years: int = 5, **train_kwargs) -> pd.DataFrame:
+    """Gold-standard time-series OOS check: train on years < holdout, predict holdout year.
+
+    Returns a DataFrame with columns: holdout_year, r2, mae, n, algorithm.
+    Expensive (one full train per holdout year) — use sparingly or with --rolling-eval flag.
+    Call with the same build_xy_fn used by the position's train() function.
+    """
+    df = df.copy()
+    years = sorted(df["year"].unique())
+    if len(years) < min_train_years + 1:
+        logger.warning("rolling_oos_eval: not enough years for %s (%d); skipping", target, len(years))
+        return pd.DataFrame(columns=["holdout_year", "r2", "mae", "n", "algorithm"])
+
+    rows = []
+    holdout_years = years[min_train_years:]  # need min_train_years worth of training data before each holdout
+    logger.info("rolling_oos_eval: %s — %d holdout years %s…%s",
+                target, len(holdout_years), holdout_years[0], holdout_years[-1])
+    for i, holdout_year in enumerate(holdout_years):
+        train_df = df[df["year"] < holdout_year]
+        oos_df = df[df["year"] == holdout_year]
+        try:
+            X_tr, y_tr, order_tr = build_xy_fn(train_df)
+            model = train_and_select(X_tr, y_tr, target, time_order=order_tr, **train_kwargs)
+            X_oos, y_oos, _ = build_xy_fn(oos_df)
+            if len(X_oos) < 2:
+                continue
+            pred = model.predict(X_oos)
+            rows.append({
+                "holdout_year": holdout_year,
+                "r2": r2_score(y_oos, pred),
+                "mae": mean_absolute_error(y_oos, pred),
+                "n": len(y_oos),
+                "algorithm": model.model_type,
+            })
+            logger.info("  holdout=%d  r2=%.3f  mae=%.3f  n=%d  algo=%s",
+                        holdout_year, rows[-1]["r2"], rows[-1]["mae"], rows[-1]["n"], model.model_type)
+        except Exception as e:
+            logger.warning("rolling_oos_eval: holdout=%d failed: %s", holdout_year, e)
+    return pd.DataFrame(rows)
