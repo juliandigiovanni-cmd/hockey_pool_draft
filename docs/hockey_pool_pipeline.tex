@@ -136,19 +136,24 @@ common/               shared library, reused every season
     historical_scoring.py     scores 18 seasons of actuals under pool rules
     historical_value_curves.py  aggregates seasons into F/D/G value curves
     pool_structure.py         snake-draft pick math, roster caps
-    strategy_sim.py           Monte Carlo position-order policy comparison
+    strategy_sim.py           Monte Carlo position-order policy comparison (POLICIES, reused live)
     report.py                 writes draft-strategy CSVs/report
+    live_state.py             live draft state (duck-types strategy_sim's POLICIES interface)
+    player_match.py           fuzzy/typo-tolerant player-name resolution for live entry
+    live_repl.py               interactive command loop for live_draft.py
   pipeline.py             stage orchestration (scrape/clean/train/predict)
 
 run_season.py         CLI entry point (rankings pipeline)
 draft_strategy.py     CLI entry point (draft position-order strategy)
+live_draft.py         CLI entry point (live, player-level draft-day assistant)
 
 <season>/             one directory per draft year, e.g. 2026-27/
   config.yaml           season parameters and scoring rules
   data/{raw,processed}/ scraped + cleaned data (gitignored)
   models/               persisted joblib artifacts (gitignored)
   results/              rankings, XLSX, report, diagnostics CSV (gitignored)
-  results/draft/        draft-strategy curves, policy comparison, round tables (gitignored)
+  results/draft/        draft-strategy curves, policy comparison, round tables, live draft state
+                         (gitignored)
   plots/                PvA and rolling-OOS plots (gitignored)
 \end{lstlisting}
 
@@ -176,6 +181,49 @@ python3 run_season.py --season 2026-27 --stage predict
   \item[\texttt{predict}] Load persisted models, append prediction rows for the target season,
         score pool points, write rankings, generate diagnostics. Runs in $\sim$2s (no retraining).
 \end{description}
+
+\subsection{Environment and running the tools}
+\label{sec:running}
+
+Every command below is run from the repository root:
+
+\begin{lstlisting}[language=bash]
+cd /Users/rcejxd36/Library/CloudStorage/Dropbox/hockeyanalytics
+\end{lstlisting}
+
+\textbf{macOS note:} use \texttt{python3}, not \texttt{python} — on this machine (and modern
+macOS generally), \texttt{python} is not on \texttt{PATH} at all (\texttt{which python} finds
+nothing); only \texttt{python3} is. Every command in this document uses \texttt{python3} for
+that reason.
+
+\textbf{One-time setup} (install dependencies — only needed once, or again after
+\texttt{requirements.txt} changes):
+
+\begin{lstlisting}[language=bash]
+python3 -m pip install -r requirements.txt
+\end{lstlisting}
+
+\textbf{The three CLI tools}, in the order used each season:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{\texttt{run\_season.py}} — the main pipeline (scrape, clean, train, predict; see
+        the stages above). Run first each season, before either draft tool.
+  \item \textbf{\texttt{draft\_strategy.py}} — position-order strategy (what order to draft
+        \emph{positions}), run once per season before draft day. Full usage in
+        Section~\ref{sec:draftstrategy}.
+  \item \textbf{\texttt{live\_draft.py}} — the live, player-level assistant, run \emph{during}
+        the actual draft:
+        \begin{lstlisting}[language=bash]
+python3 live_draft.py --season 2026-27 --my-slot 4
+        \end{lstlisting}
+        This is interactive — leave it running in a terminal window for the whole draft. Type
+        \texttt{pick <player name>} for every pick as it's announced (yours and every
+        opponent's — this pool's draft is manual/verbal, so there's nothing to pull picks from
+        automatically). Type \texttt{help} inside the tool for the full command list
+        (\texttt{show}, \texttt{top}, \texttt{undo}, \texttt{quit}). State saves to disk after
+        every pick, so if the terminal closes or the laptop sleeps, re-running the same command
+        resumes exactly where it left off.
+\end{enumerate}
 
 
 % ===========================================================================
@@ -1244,13 +1292,15 @@ file already produced by that pipeline.
         team they played the most games for. This would make the team-context lag features
         more accurate for the $\sim$5--10\% of historical rows involving mid-season trades.
 
-  \item[Interactive draft-day tool (player-level, live)]
-        The \emph{position-order} strategy piece is now built (Section~\ref{sec:draftstrategy},
-        \texttt{draft\_strategy.py}). What remains is the live, player-level assistant: show
-        remaining available players ranked by pool points during the actual draft, allow
-        filtering by position, mark picked players as they come off the board, and recompute
-        recommendations in real time. Deliberately deferred and scoped separately — the
-        position-order tool above is intentionally player-identity-free.
+  \item[Done, 2026-08-25: interactive draft-day tool]
+        \texttt{live\_draft.py} (backed by \texttt{common/draft/live\_state.py},
+        \texttt{player\_match.py}, \texttt{live\_repl.py}) is a live, player-level CLI assistant:
+        picks (the user's and every opponent's — the league's draft is manual/verbal, no
+        platform to pull from) are entered by hand with typo/partial-name-tolerant matching, and
+        on the user's turn it recommends a player using the same position-order policy logic as
+        Section~\ref{sec:draftstrategy} — reused unchanged against live availability instead of
+        the historical Monte Carlo simulation. See \texttt{PROJECT.md}'s 2026-08-25 changelog
+        entry for full detail; a fuller write-up here is deferred until after first real-draft use.
 
   \item[2027-28 season]
         Copy \texttt{2026-27/config.yaml} $\to$ \texttt{2027-28/config.yaml}, update

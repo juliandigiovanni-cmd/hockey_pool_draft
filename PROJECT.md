@@ -28,7 +28,17 @@ common/            shared package, reused every season
     model_report.py    model fit diagnostics: metrics table, PvA plots, baseline R², rolling OOS
   pipeline.py          stage functions: scrape / clean / train / predict
 
-run_season.py       CLI entry point: python run_season.py --season 2026-27 --stage all|scrape|clean|train|predict
+  draft/
+    historical_scoring.py     scores 18 seasons of actuals under pool rules
+    historical_value_curves.py  aggregates seasons into F/D/G value curves
+    pool_structure.py         snake-draft pick math, roster caps
+    strategy_sim.py           Monte Carlo position-order policy comparison (POLICIES, reused live)
+    report.py                 writes draft-strategy CSVs/report
+    live_state.py             live draft state (duck-types strategy_sim's POLICIES interface)
+    player_match.py           fuzzy/typo-tolerant player-name resolution for live entry
+    live_repl.py               interactive command loop for live_draft.py
+
+run_season.py       CLI entry point: python3 run_season.py --season 2026-27 --stage all|scrape|clean|train|predict
 
 <season>/            one folder per draft year, e.g. 2026-27/
   config.yaml           season id, trade overrides, scoring rules, roster-snapshot date
@@ -38,18 +48,65 @@ run_season.py       CLI entry point: python run_season.py --season 2026-27 --sta
   plots/                 diagnostics (gitignored)
   results/diagnostics/   source_reconciliation.csv, model_metrics.csv
   plots/diagnostics/     pva_*.png (predicted-vs-actual + residuals per model)
-  results/draft/         draft-strategy curves, policy comparison, round tables (gitignored)
+  results/draft/         draft-strategy curves, policy comparison, round tables, live draft state (gitignored)
 ```
 
-`draft_strategy.py` (repo root) is a separate CLI entry point: `python draft_strategy.py --season
+`draft_strategy.py` (repo root) is a separate CLI entry point: `python3 draft_strategy.py --season
 2026-27 [--my-slot 1-9]`, backed by `common/draft/` (historical_scoring.py, historical_value_curves.py,
 pool_structure.py, strategy_sim.py, report.py). It answers a different question from the rankings
 pipeline above — not "which players," but "in what order should positions be drafted" — and reads
 the rankings pipeline's outputs without modifying it.
 
+`live_draft.py` (repo root) is the live, player-level draft-day assistant: `python3 live_draft.py
+--season 2026-27 --my-slot <N>`, backed by `common/draft/live_state.py`, `player_match.py`, and
+`live_repl.py`. Answers "which player should I take right now" during the actual draft, reusing
+`strategy_sim.py`'s position-order policies unchanged against live pick data instead of the
+historical Monte Carlo simulation. See "Running the tools" below for full usage.
+
 `2025-26/` is last year's original ad-hoc build (24 near-duplicate model scripts, no shared
 library, nothing persisted, no git tracking). It's kept as historical reference only — not
 imported by anything in `common/`.
+
+## Running the tools
+
+All commands run from the repo root (`cd` there first):
+```
+cd /Users/rcejxd36/Library/CloudStorage/Dropbox/hockeyanalytics
+```
+
+**macOS note**: use `python3`, not `python` — on this machine (and modern macOS generally),
+`python` isn't on `PATH` at all (`which python` finds nothing); only `python3` is. Every command
+below uses `python3` for that reason.
+
+**One-time setup** (install dependencies — only needed once, or after `requirements.txt` changes):
+```
+python3 -m pip install -r requirements.txt
+```
+
+**The three CLI tools**, in the order you'd typically use them:
+
+1. **`run_season.py`** — the main pipeline (scrape data, clean it, train models, produce
+   rankings). Run this first each season, before either draft tool:
+   ```
+   python3 run_season.py --season 2026-27 --stage all       # full pipeline
+   python3 run_season.py --season 2026-27 --stage predict   # reuse trained models, just re-score
+   ```
+2. **`draft_strategy.py`** — position-order strategy (what order to draft *positions*), built
+   from historical simulation, run once per season before draft day:
+   ```
+   python3 draft_strategy.py --season 2026-27
+   python3 draft_strategy.py --season 2026-27 --my-slot 4    # + your slot's round-by-round table
+   ```
+3. **`live_draft.py`** — the live, player-level assistant, run *during* the actual draft (leave
+   it running in a terminal window for the whole draft — it's interactive):
+   ```
+   python3 live_draft.py --season 2026-27 --my-slot 4
+   ```
+   Then type `pick <player name>` for every pick as it's announced (yours and every opponent's —
+   this pool's draft is manual/verbal, so there's nothing to pull picks from automatically).
+   Type `help` inside the tool for the full command list (`show`, `top`, `undo`, `quit`). State
+   saves after every pick, so if you close the terminal or the laptop sleeps, just re-run the
+   same command to pick up exactly where you left off.
 
 ## Pool scoring rules
 
@@ -383,10 +440,69 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
     no outstanding edge cases to fix; P5 (majority-team for traded players) — data-completeness
     work, not model-fit; P6 (interactive draft-day tool) — deferred pending further discussion.
 
+- **2026-08-25 — Interactive draft-day tool** (`live_draft.py`, `common/draft/live_state.py`,
+  `common/draft/player_match.py`, `common/draft/live_repl.py`):
+  - The last item on the Future Work list. Answers a question distinct from both the player-
+    ranking pipeline ("which players") and the position-order strategy tool ("what order to
+    draft positions"): "which specific player should I take right now," live, during the actual
+    draft. The league's draft is manual/verbal with no external platform, so every pick — the
+    user's own and all 8 opponents' — is entered by hand as it happens; this is a personal,
+    single-user CLI tool, not a shared/multi-user app.
+  - **Key reuse finding**: `common/draft/strategy_sim.py`'s position-choice policy functions
+    (`_value_greedy`/`_balanced_need`/`_urgency_greedy`, exposed via `POLICIES`) are already
+    duck-typed against a `state` object exposing exactly six members
+    (`next_value`/`value_at_offset`/`my_counts`/`caps`/`remaining_need`/`intervening_picks`) —
+    none of them touch the Monte Carlo simulation's internals directly. A new `_LiveState` class
+    (`live_state.py`) implements the same six members backed by live data instead of a historical
+    value curve, so `POLICIES` is reused **completely unchanged** — zero edits to
+    `strategy_sim.py`. `common/draft/pool_structure.py` (`DraftConfig`, `team_at_pick`,
+    `picks_for_slot`) is likewise reused unchanged.
+  - `player_match.py`: stdlib-only (`difflib`) fuzzy name resolution for live entry under time
+    pressure — exact match, then partial-token containment, then typo-tolerant fallback:
+    `Unique`/`Ambiguous`/`AlreadyTaken`/`NotFound`. Handles real ambiguous cases in the actual
+    2026-27 data (e.g. two players named "Elias Pettersson"; "Makar" matching both Cale Makar
+    and an unrelated depth forward) with a numbered disambiguation prompt.
+  - `live_repl.py`: a REPL (not per-pick script re-invocation, to avoid reloading/replaying state
+    from disk on every keystroke over a ~1-2hr, 153-pick draft) with `pick <name>` (team implied
+    by turn order — the primary, lowest-friction path), `pick @<team> <name>` (out-of-order
+    correction), `show`, `top <position> [n]`, `undo` (with confirm), `help`, `quit`. On the
+    user's own turn, auto-prints a recommendation panel: the winning policy for their slot (read
+    from `draft_strategy.py`'s already-computed `results/draft/policy_comparison.csv`, default
+    `balanced_need` with a warning if that file doesn't exist), current roster fill vs. cap, the
+    policy's recommended position, and the top-N real available players there (by actual
+    `pool_points`, plus a shorter list per other eligible position).
+  - State persists to `results/draft/live_draft_state.json` (already covered by the existing
+    `20*-*/results/*` gitignore rule) as an **event log**, not aggregated state — `undo` is just
+    pop-and-replay, and resume replays the whole log through the same `apply()` path a live pick
+    would use, so persisted and in-memory state can never diverge. Written atomically
+    (temp file + `Path.replace()`) so a crash mid-write can't corrupt it.
+  - Added a first-ever pytest suite (`tests/`, `pytest>=8.0` added to `requirements.txt`) for the
+    resolver and state/replay logic — a deliberate, scoped departure from this repo's no-test-
+    suite convention, justified by how costly a subtle bug in name-matching or undo/resume would
+    be live during an actual draft. 22 tests, including a parametrized check that all three
+    `POLICIES` functions run correctly against `_LiveState` — the core reuse claim above.
+  - Verified end-to-end without a real draft: a scripted mock draft (round-robin eligible
+    positions, top-available player each pick, replaying `team_at_pick` order) ran all 153 picks
+    cleanly via stdin, produced the correct final roster (10F/5D/2G, exactly matching caps); a
+    40-pick-in/quit/resume split produced an identical final roster to the unbroken run; cap-
+    rejection and ambiguous-name disambiguation (including the real "Elias Pettersson" and
+    "Makar" cases above) verified interactively.
+  - A design/algorithm writeup (matching e.g. §9's "Prediction Blending for Defense" level of
+    detail) is deliberately deferred until after first real-draft use, per the existing Known
+    Limitations note that logging an actual draft would enable future empirical calibration.
+  - **2026-08-25 (later same day) — runbook added**: a new "Running the tools" section added to
+    both `PROJECT.md` (below) and `docs/hockey_pool_pipeline.tex` §2.3 "Environment and running
+    the tools" — working directory, a macOS-specific note to use `python3` (`python` isn't on
+    `PATH` at all on this machine — confirmed via `which python`), one-time `pip install`, and
+    example invocations for all three CLI tools (`run_season.py`, `draft_strategy.py`,
+    `live_draft.py`). The tex/PROJECT.md folder-layout listings were also updated to include
+    `live_draft.py` and the three new `common/draft/live_*.py` modules, which were missing.
+
 ## Future milestones (not in scope for the 2026-27 rebuild)
 
 Listed in priority order. (P1-P3 from the prior list — observation weighting, joint GAA/save%,
-and the joint D-men model — are done; see the 2026-08-25 changelog entry above.)
+and the joint D-men model — are done; see the 2026-08-25 changelog entries above. The interactive
+draft-day tool, formerly P3, is also done — see below.)
 
 - **P1 — GP diagnostic Layer 2 (game-log debut-date confirmation)**: for any player whose debut
   season has GP < 50, fetch the game log via the existing `get_player_game_log()` endpoint and
@@ -397,10 +513,5 @@ and the joint D-men model — are done; see the 2026-08-25 changelog entry above
   recent season. Expanding to full history (one API call per player per historical season) would
   assign each player to the team they played most games for, making team-context lag features more
   accurate for the ~5–10% of rows involving mid-season trades. High API cost for marginal gain.
-- **P3 — Interactive draft-day tool (player-level, live)**: the position-order strategy piece is
-  now built (2026-08-24, see changelog above and `docs/hockey_pool_pipeline.tex` §12) — this
-  remaining item is narrower than originally scoped: a live tool that shows remaining available
-  *players* ranked by pool points during the actual draft, lets you mark picks as they happen,
-  and recomputes recommendations in real time. Needs further discussion before starting.
 - **2027-28 season**: copy `2026-27/config.yaml` → `2027-28/config.yaml`, update
   season/trade-override/roster-date fields, run `--stage all`. That's the full annual process.

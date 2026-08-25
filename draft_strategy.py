@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Position-order draft strategy tool (not a live player-by-player draft assistant — see
-PROJECT.md's deferred "P6 - Interactive draft-day tool" milestone for that).
+live_draft.py for that).
 
 Builds F/D/G value curves from 18 seasons (2008-09..2025-26) of real historical stats scored
 under the pool's rules, then Monte Carlo-simulates the 9-team snake draft to compare candidate
