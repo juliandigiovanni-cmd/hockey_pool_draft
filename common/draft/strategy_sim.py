@@ -108,7 +108,14 @@ class _State:
         return max(p - self._pick - 1, 0)
 
     def eligible(self, team: int) -> list[str]:
-        return [p for p in POSITIONS if self.team_counts[team][p] < self.caps[p]]
+        """Positions this team may draft next. All 11 starter slots (7F/3D/1G) must be filled,
+        in any order/mix among still-open starter categories, before any bench slot opens up —
+        e.g. a 2nd goalie is never eligible until the starter F/D/G slots are all full, even
+        though total goalie capacity (starter + bench) would otherwise allow it."""
+        counts = self.team_counts[team]
+        if sum(counts.values()) < sum(self.dcfg.starter_caps.values()):
+            return [p for p in POSITIONS if counts[p] < self.dcfg.starter_caps[p]]
+        return [p for p in POSITIONS if counts[p] < self.caps[p]]
 
     def apply(self, team: int, position: str) -> float:
         value = self.next_value(position)

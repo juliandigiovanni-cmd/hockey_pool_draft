@@ -236,15 +236,74 @@ def _blend(df: pd.DataFrame, pred_col: str, ref_col: str, alpha: float) -> pd.Se
     return blended.fillna(df[pred_col])
 
 
+# --------------------------------------------------------------------------- breakout score
+
+# Predicted-rank cutoff below which a high breakout_score is actually interesting: an
+# already-top-of-position player trending up is just "great and improving," not a hidden late-
+# round gem. There's no ADP/consensus draft data anywhere in this pipeline, so this proxies
+# "late round" via the model's own predicted rank rather than real draft-day availability.
+_DARK_HORSE_RANK_CUTOFF = {"forward": 30, "defense": 15, "goalie": 8}
+_DARK_HORSE_Z_THRESHOLD = 1.0
+
+
+def _col_or_zero(df: pd.DataFrame, col: str) -> pd.Series:
+    return df[col] if col in df.columns else pd.Series(0.0, index=df.index)
+
+
+def _zscore(s: pd.Series) -> pd.Series:
+    std = s.std(ddof=0)
+    if not std or pd.isna(std):
+        return pd.Series(0.0, index=s.index)
+    return (s - s.mean()) / std
+
+
+def _add_breakout_score(df: pd.DataFrame, pred_col: str, hist_col: str,
+                        luck_col: str | None = None, luck_expr: pd.Series | None = None) -> pd.DataFrame:
+    """Combine two signals into one z-scored `breakout_score`, both already leakage-safe,
+    multi-year-averaged engineered columns (no new feature engineering needed):
+
+    1. Model-vs-history divergence: `pred_col - hist_col` — how much more the model predicts
+       than the player's own recent track record (the same `*_hist_avg` reference already used
+       by `_blend()`, exposed here as a standalone signal instead of only being blended away).
+    2. Underlying-metric regression candidate: `luck_expr` (or `df[luck_col]`) — e.g. recent
+       expected goals minus recent actual goals for skaters (positive = due for positive
+       regression), or GSAx directly for goalies (already skill-adjusted).
+
+    Z-scored within the position group (df) since the two raw signals have different units/scale
+    and shouldn't be compared in raw form; combined as their unweighted average.
+    """
+    df = df.copy()
+    divergence = (df[pred_col] - df[hist_col]) if hist_col in df.columns else pd.Series(0.0, index=df.index)
+    if luck_expr is not None:
+        luck = luck_expr
+    elif luck_col is not None and luck_col in df.columns:
+        luck = df[luck_col]
+    else:
+        luck = pd.Series(0.0, index=df.index)
+    df["breakout_score"] = ((_zscore(divergence.fillna(0)) + _zscore(luck.fillna(0))) / 2).round(2)
+    return df
+
+
+def _add_dark_horse_flag(df: pd.DataFrame, position: str) -> pd.DataFrame:
+    """Flag `dark_horse` = high breakout_score AND not already an obviously-good predicted rank
+    (see `_DARK_HORSE_RANK_CUTOFF`). Must run after `rank` is assigned."""
+    df = df.copy()
+    cutoff = _DARK_HORSE_RANK_CUTOFF.get(position, 30)
+    df["dark_horse"] = (df["breakout_score"] > _DARK_HORSE_Z_THRESHOLD) & (df["rank"] > cutoff)
+    return df
+
+
 # --------------------------------------------------------------------------- outputs
 
 def _rank(df: pd.DataFrame, position: str) -> pd.DataFrame:
-    cols = [c for c in ["player_id", "player_name", "team_abbrev",
-                        "projected_games", "pool_points", "pool_points_full_season"]
+    cols = [c for c in ["player_id", "player_name", "team_abbrev", "projected_games",
+                        "pool_points", "pool_points_full_season", "breakout_score"]
             if c in df.columns]
     out = df[cols].sort_values("pool_points", ascending=False).reset_index(drop=True)
     out.insert(0, "position", position)
     out.insert(0, "rank", out.index + 1)
+    if "breakout_score" in out.columns:
+        out = _add_dark_horse_flag(out, position)
     return out
 
 
@@ -359,6 +418,18 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
                         ("gaa", "pred_gaa"), ("save_pct", "pred_save_pct")]:
         m = models.get(f"goalie_{target}")
         goal_rows[col] = m.predict(goal_rows) if m is not None else np.nan
+
+    # Breakout ("dark horse") score: model-vs-history divergence + an underlying-metric
+    # (shot-quality/GSAx) regression-candidate signal, both already-computed engineered columns
+    # (see _add_breakout_score docstring). Purely additive — doesn't affect pool_points/rankings.
+    fwd_luck = _col_or_zero(fwd_rows, "mp_I_F_xGoals_hist_avg") - _col_or_zero(fwd_rows, "goals_hist_avg")
+    fwd_rows = _add_breakout_score(fwd_rows, "pred_points_per_game", "points_per_game_hist_avg",
+                                   luck_expr=fwd_luck)
+    def_luck = _col_or_zero(def_rows, "mp_I_F_xGoals_hist_avg") - _col_or_zero(def_rows, "goals_hist_avg")
+    def_rows = _add_breakout_score(def_rows, "pred_points_per_game", "points_per_game_hist_avg",
+                                   luck_expr=def_luck)
+    goal_rows = _add_breakout_score(goal_rows, "pred_wins_per_game", "wins_per_game_hist_avg",
+                                    luck_col="gsax_hist_avg")
 
     scored = compute_pool_points(cfg, fwd_rows, def_rows, goal_rows)
 

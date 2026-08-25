@@ -5,6 +5,9 @@ interface `strategy_sim._State` exposes to them — `next_value`, `value_at_offs
 of looking up a historical value *curve* by rank, `next_value`/`value_at_offset` look up the
 actual best-still-available real player's predicted `pool_points` from the current season's
 rankings, since in live use we know exactly which real players are already gone.
+
+`eligible()` enforces the starters-before-bench draft mechanic (see `pool_structure.py`): all 11
+starter slots (7F/3D/1G) must be filled before any bench slot opens up, for every team.
 """
 
 from __future__ import annotations
@@ -97,7 +100,14 @@ class _LiveState:
         return max(p - self._pick - 1, 0)
 
     def eligible(self, team: int) -> list[str]:
-        return [p for p in POSITIONS if self.team_counts[team][p] < self.caps[p]]
+        """Positions this team may draft next. All 11 starter slots (7F/3D/1G) must be filled,
+        in any order/mix among still-open starter categories, before any bench slot opens up —
+        e.g. a 2nd goalie is never eligible until the starter F/D/G slots are all full, even
+        though total goalie capacity (starter + bench) would otherwise allow it."""
+        counts = self.team_counts[team]
+        if sum(counts.values()) < sum(self.dcfg.starter_caps.values()):
+            return [p for p in POSITIONS if counts[p] < self.dcfg.starter_caps[p]]
+        return [p for p in POSITIONS if counts[p] < self.caps[p]]
 
     def current_team(self) -> int:
         return team_at_pick(self._pick, self.dcfg.num_teams)

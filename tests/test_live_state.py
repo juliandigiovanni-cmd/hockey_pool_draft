@@ -16,10 +16,25 @@ from common.draft.strategy_sim import POLICIES
 @pytest.fixture
 def dcfg() -> DraftConfig:
     # Small 2-team, 1-slot-per-position draft (6 total picks) for fast, easy-to-reason-about tests.
+    # starter_caps == caps (bench_caps all 0) collapses starter/bench phases into one, preserving
+    # this fixture's original (pre-phase-constraint) semantics for the tests that use it.
     caps = {"forward": 1, "defense": 1, "goalie": 1}
     return DraftConfig(num_teams=2, rounds=3, caps=caps,
+                      starter_caps=caps, bench_caps={p: 0 for p in caps},
                       league_totals={p: c * 2 for p, c in caps.items()},
                       opponent_temperature=1.5, mc_sims=10)
+
+
+@pytest.fixture
+def dcfg_with_bench() -> DraftConfig:
+    # A real starter/bench split, for testing the starters-before-bench draft mechanic itself:
+    # starters = 2F/1D/1G (4 total), bench = 1F/1D/1G (3 total), full caps = 3F/2D/2G.
+    starter_caps = {"forward": 2, "defense": 1, "goalie": 1}
+    bench_caps = {"forward": 1, "defense": 1, "goalie": 1}
+    caps = {p: starter_caps[p] + bench_caps[p] for p in starter_caps}
+    return DraftConfig(num_teams=1, rounds=sum(caps.values()), caps=caps,
+                      starter_caps=starter_caps, bench_caps=bench_caps,
+                      league_totals=caps, opponent_temperature=1.5, mc_sims=10)
 
 
 @pytest.fixture
@@ -72,6 +87,38 @@ def test_apply_rejects_when_cap_full(dcfg, rankings):
     # rejected pick must not have mutated state
     assert s.team_counts[1]["forward"] == 1
     assert not s.pool.is_taken(2)
+
+
+def test_second_goalie_ineligible_before_starters_complete(dcfg_with_bench, rankings):
+    """The bug the user caught: a 2nd goalie must not be draftable before all starter slots
+    (2F/1D/1G here) are filled, even though total goalie capacity (2) would otherwise allow it."""
+    s = _state(dcfg_with_bench, rankings, my_slot=1)
+    s.apply(team=1, player_id=101, position="goalie")  # fills the 1 starter goalie slot
+    assert "goalie" not in s.eligible(1)  # still 3 starter slots left (2F/1D), not yet bench phase
+    with pytest.raises(ValueError):
+        s.apply(team=1, player_id=102, position="goalie")
+
+
+def test_starter_phase_forces_last_open_starter_position(dcfg_with_bench, rankings):
+    """Once every other starter category is full, eligible() must narrow to just the one
+    remaining open starter slot — this is what forces the correct round-11-equivalent pick in
+    the real 7F/3D/1G/6-round-bench draft."""
+    s = _state(dcfg_with_bench, rankings, my_slot=1)
+    s.apply(team=1, player_id=201, position="forward")
+    s.apply(team=1, player_id=202, position="forward")  # starter forward cap (2) now full
+    s.apply(team=1, player_id=203, position="defense")  # starter defense cap (1) now full
+    assert s.eligible(1) == ["goalie"]  # only the starter goalie slot remains open
+
+
+def test_bench_phase_unlocks_after_all_starters_filled(dcfg_with_bench, rankings):
+    s = _state(dcfg_with_bench, rankings, my_slot=1)
+    s.apply(team=1, player_id=301, position="forward")
+    s.apply(team=1, player_id=302, position="forward")
+    s.apply(team=1, player_id=303, position="defense")
+    s.apply(team=1, player_id=304, position="goalie")  # completes all 4 starter slots
+    # Now in bench phase: every position with remaining total capacity is eligible again,
+    # including goalie (starter cap 1 reached, but bench cap 1 still open -> full cap 2).
+    assert set(s.eligible(1)) == {"forward", "defense", "goalie"}
 
 
 def test_undo_reverts_exactly(dcfg, rankings):

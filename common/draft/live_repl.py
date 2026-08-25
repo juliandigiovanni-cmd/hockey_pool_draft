@@ -26,10 +26,12 @@ Commands:
   pick @<team> <name>  Mark a pick for an explicit team number (out-of-order correction)
   show                 Show current turn + your roster fill + recommendation (if your turn)
   top <position> [n]   Show the top n available players at a position, any time
+  sleepers [pos] [n]   Show dark-horse (breakout_score) candidates, any time
   undo                 Undo the most recent pick (asks to confirm)
   help                 Show this message
   quit / exit          Save and exit (resume later by re-running without --reset)
 """
+_DARK_HORSE_MARKER = " \U0001F525"  # fire emoji, flags dark_horse=True players in listings
 
 
 def _now_iso() -> str:
@@ -176,8 +178,14 @@ class LiveDraftSession:
     def _commit_pick(self, team: int, row: pd.Series) -> None:
         position = str(row["position"])
         if position not in self.state.eligible(team):
-            print(f"Team {team} already has a full {position} roster "
-                 f"(cap {self.dcfg.caps[position]}) — pick rejected.")
+            counts = self.state.team_counts[team]
+            if sum(counts.values()) < sum(self.dcfg.starter_caps.values()):
+                print(f"Team {team}'s starter {position} slot(s) are already full "
+                     f"(cap {self.dcfg.starter_caps[position]}) — bench slots don't open until "
+                     f"all 11 starter slots are filled. Pick rejected.")
+            else:
+                print(f"Team {team} already has a full {position} roster "
+                     f"(cap {self.dcfg.caps[position]}) — pick rejected.")
             return
         pick_no = self.state._pick
         player_id = int(row["player_id"])
@@ -226,6 +234,40 @@ class LiveDraftSession:
                 print(f"Invalid count: {parts[1]!r}")
                 return
         self._print_top(position, n, header=f"Top {n} available {position}:")
+
+    def cmd_sleepers(self, arg: str) -> None:
+        if "dark_horse" not in self.pool.rankings.columns:
+            print("No breakout_score/dark_horse data in this season's rankings — re-run "
+                 "run_season.py --stage predict to generate it.")
+            return
+        parts = arg.split()
+        position = None
+        if parts and parts[0].lower() in POSITIONS:
+            position = parts[0].lower()
+            parts = parts[1:]
+        n = self.top_n
+        if parts:
+            try:
+                n = int(parts[0])
+            except ValueError:
+                print(f"Invalid count: {parts[0]!r}")
+                return
+
+        found_any = False
+        for pos in [position] if position else list(POSITIONS):
+            avail = self.pool.available(pos)
+            sleepers = (avail[avail["dark_horse"]]
+                       .sort_values("breakout_score", ascending=False).head(n))
+            if sleepers.empty:
+                continue
+            found_any = True
+            print(f"Sleepers — {pos}:")
+            for _, r in sleepers.iterrows():
+                print(f"    {r['player_name']:<26} {r['team_abbrev']:<5} "
+                     f"pool_points={r['pool_points']:.1f}  breakout={r['breakout_score']:.2f}")
+        if not found_any:
+            where = f" at {position}" if position else ""
+            print(f"No dark-horse candidates currently available{where}.")
 
     # -------------------------------------------------------------- display
 
@@ -289,9 +331,11 @@ class LiveDraftSession:
         if avail.empty:
             print("    (none available)")
             return
+        has_dark_horse = "dark_horse" in avail.columns
         for _, r in avail.iterrows():
+            marker = _DARK_HORSE_MARKER if has_dark_horse and bool(r["dark_horse"]) else ""
             print(f"    {r['player_name']:<26} {r['team_abbrev']:<5} "
-                 f"pool_points={r['pool_points']:.1f}")
+                 f"pool_points={r['pool_points']:.1f}{marker}")
 
 
 def run(session: LiveDraftSession) -> None:
@@ -330,6 +374,8 @@ def run(session: LiveDraftSession) -> None:
             session.print_status_panel()
         elif cmd == "top":
             session.cmd_top(arg)
+        elif cmd == "sleepers":
+            session.cmd_sleepers(arg)
         elif cmd == "undo":
             session.cmd_undo()
         elif cmd == "pick":

@@ -11,8 +11,9 @@
 \usepackage{longtable}
 \usepackage[hidelinks]{hyperref}
 \usepackage{listings}
-\usepackage{xcolor}
+\usepackage[table]{xcolor}
 \usepackage{graphicx}
+\usepackage{float}
 \usepackage{parskip}
 \usepackage{enumitem}
 \usepackage{microtype}
@@ -33,6 +34,11 @@
   aboveskip=8pt,
   belowskip=4pt,
 }
+
+% ---- position colors (used in the full 9-slot draft-order grid) ----
+\definecolor{fwdcolor}{RGB}{198,219,239}
+\definecolor{defcolor}{RGB}{199,233,192}
+\definecolor{goalcolor}{RGB}{253,208,162}
 
 % ---- table column types ----
 \newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
@@ -136,24 +142,24 @@ common/               shared library, reused every season
     historical_scoring.py     scores 18 seasons of actuals under pool rules
     historical_value_curves.py  aggregates seasons into F/D/G value curves
     pool_structure.py         snake-draft pick math, roster caps
-    strategy_sim.py           Monte Carlo position-order policy comparison (POLICIES, reused live)
+    strategy_sim.py           Monte Carlo position-order comparison
     report.py                 writes draft-strategy CSVs/report
-    live_state.py             live draft state (duck-types strategy_sim's POLICIES interface)
-    player_match.py           fuzzy/typo-tolerant player-name resolution for live entry
-    live_repl.py               interactive command loop for live_draft.py
+    live_state.py             live draft state (duck-types POLICIES)
+    player_match.py           fuzzy/typo-tolerant player-name resolution
+    live_repl.py              interactive command loop for live_draft.py
   pipeline.py             stage orchestration (scrape/clean/train/predict)
 
 run_season.py         CLI entry point (rankings pipeline)
 draft_strategy.py     CLI entry point (draft position-order strategy)
-live_draft.py         CLI entry point (live, player-level draft-day assistant)
+live_draft.py         CLI entry point (live draft-day assistant)
 
 <season>/             one directory per draft year, e.g. 2026-27/
   config.yaml           season parameters and scoring rules
   data/{raw,processed}/ scraped + cleaned data (gitignored)
   models/               persisted joblib artifacts (gitignored)
   results/              rankings, XLSX, report, diagnostics CSV (gitignored)
-  results/draft/        draft-strategy curves, policy comparison, round tables, live draft state
-                         (gitignored)
+  results/draft/        draft-strategy curves, policy comparison, round
+                         tables, live draft state (gitignored)
   plots/                PvA and rolling-OOS plots (gitignored)
 \end{lstlisting}
 
@@ -220,7 +226,8 @@ python3 live_draft.py --season 2026-27 --my-slot 4
         \texttt{pick <player name>} for every pick as it's announced (yours and every
         opponent's — this pool's draft is manual/verbal, so there's nothing to pull picks from
         automatically). Type \texttt{help} inside the tool for the full command list
-        (\texttt{show}, \texttt{top}, \texttt{undo}, \texttt{quit}). State saves to disk after
+        (\texttt{show}, \texttt{top}, \texttt{sleepers}, \texttt{undo}, \texttt{quit}). State
+        saves to disk after
         every pick, so if the terminal closes or the laptop sleeps, re-running the same command
         resumes exactly where it left off.
 \end{enumerate}
@@ -868,6 +875,52 @@ A goalie is \emph{qualified} for the bonus if $\text{GP}_i^{\text{proj}} \geq 40
 The GAA bonus goes to $\arg\min_i \hat{y}_i^{\text{GAA}}$ among qualified goalies;
 the save\% bonus to $\arg\max_i \hat{y}_i^{\text{sv\%}}$.
 
+\subsection{Breakout score (dark-horse detection)}
+\label{sec:breakout}
+
+Added 2026-08-25: a \texttt{breakout\_score} and \texttt{dark\_horse} flag on every player,
+answering "who's an overlooked late-round upside pick" — computed entirely from engineered
+columns that already exist (no new scraping, no training-pipeline change), in
+\texttt{pool\_ranking.\_add\_breakout\_score()}. Two signals, each already leakage-safe and
+multi-year-averaged:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Model-vs-history divergence}: $\hat{y}_i^{\text{pred}} -
+        \overline{y}_i^{\text{hist}}$ — the same \texttt{*\_hist\_avg} reference column already
+        used by the defense blend (Section~\ref{sec:blending}), exposed as a standalone signal:
+        how much more the model predicts than the player's own recent track record.
+  \item \textbf{Underlying-metric regression candidate}: for forwards/defense,
+        $\overline{\text{xG}}_i^{\text{hist}} - \overline{\text{goals}}_i^{\text{hist}}$ using
+        MoneyPuck's individual expected-goals column (already joined and auto-lagged for
+        skaters, Section~\ref{sec:data}) — positive means a player has recently scored fewer
+        goals than their shot quality implies, a "due for positive regression" signal. For
+        goalies, \texttt{gsax\_hist\_avg} directly (already skill-adjusted; no subtraction
+        needed).
+\end{enumerate}
+
+Both signals are z-scored within their position group (different units/scale, and across
+positions) and averaged: $\text{breakout\_score}_i = \tfrac{1}{2}(z(\text{divergence}_i) +
+z(\text{luck}_i))$. \texttt{dark\_horse} flags $\text{breakout\_score}_i > 1.0$ \emph{and} a
+predicted rank outside an already-obviously-good cutoff (rank $>$ 30 forwards, $>$ 15 defense,
+$>$ 8 goalies) — a top-5 player trending up is not a hidden gem, so the flag is gated by rank in
+addition to the raw score, which is still written to output either way.
+
+\textbf{Caveats}: (1) no ADP/consensus draft-position data exists anywhere in this pipeline, so
+"late round" is necessarily proxied via the model's own predicted rank, not a real
+"will still be there in your round" guarantee. (2) The regression-candidate signal can't
+distinguish genuine repeatable elite shooting talent from one-off shooting variance — an elite
+sniper who reliably outscores their xG will show a \emph{negative} luck z-score by this formula
+(and did, in the first real run: MacKinnon, Kucherov, Draisaitl all score strongly negative
+overall) — this is an inherent simplification, not a bug, and matches why the very top of the
+rankings never gets flagged \texttt{dark\_horse} regardless of the rank gate.
+
+\textbf{Live-draft integration}: since \texttt{live\_draft.py}'s available-player pool is just
+this rankings data with picked players removed, both columns flow through automatically — a
+fire-emoji marker annotates \texttt{dark\_horse} players inline in every "top available" listing
+(the recommendation panel and \texttt{top}), and a dedicated \texttt{sleepers [position] [n]}
+command shows only dark-horse candidates, sorted by \texttt{breakout\_score}, available at any
+point in the draft (no round-based gating).
+
 
 % ===========================================================================
 \section{Diagnostics}
@@ -912,9 +965,9 @@ A compact table is printed to stdout at the end of every predict run:
 
 \begin{lstlisting}
 === Model fit summary ===
-label             algorithm  test_r2  baseline_r2  beats_baseline  spearman_r  concordance  directional_acc  oos_r2  oos_spearman_r  oos_concordance
-Fwd Points/G      gradient_boosting   0.712    0.001     True  0.843  0.912   0.81   0.665   0.812   0.897
-Def Points/G      ridge               0.531    0.001     True  0.741  0.869   0.74   0.402   0.711   0.851
+label         algorithm      test_r2  oos_r2  concordance  oos_concordance
+Fwd Points/G  grad_boosting  0.712    0.665   0.912        0.897
+Def Points/G  ridge          0.531    0.402   0.869        0.851
 ...
 \end{lstlisting}
 
@@ -1095,7 +1148,18 @@ pick, a team chooses among its still-open positions via a softmax over each elig
 current top-of-curve value (temperature $\tau=1.5$ by default), approximating "best player
 available among remaining needs" without deeper per-team modeling. The user's own picks are
 generated by one of three candidate policies, compared via $M=1500$ Monte Carlo drafts per
-policy per draft slot:
+policy per draft slot.
+
+\textbf{Starters-before-bench draft mechanic (fixed 2026-08-25):} every team — opponents included,
+not just the user — must fill all 11 starter slots (7F/3D/1G, in any order/mix among still-open
+starter categories) before any of the 6 bench slots (3F/2D/1G) becomes draftable; e.g.\ a 2nd
+goalie is never "still-open" until the starter F/D/G slots are all full, even though total goalie
+capacity would otherwise allow it. A prior version of this simulation omitted this constraint
+(only enforcing the *combined* starters+bench cap per position), which let recommendations
+illegally draft a 2nd goalie as early as round 11 — see \texttt{PROJECT.md}'s changelog for the
+concrete before/after trace. \texttt{eligible()} in \texttt{strategy\_sim.\_State} now restricts
+each team to starter-open positions until all 11 starter slots are filled, then to any
+still-under-cap position; every result below reflects the corrected constraint.
 
 \begin{description}[leftmargin=3cm, style=nextline]
   \item[\texttt{value\_greedy}] Always take the eligible position with the highest current
@@ -1115,82 +1179,120 @@ policy per draft slot:
 \toprule
 Slot & value\_greedy & balanced\_need & urgency\_greedy & Winner \\
 \midrule
-1 & 1076.3 & 1083.8 & \textbf{1084.0} & urgency\_greedy \\
-2 & 1065.2 & \textbf{1074.0} & 1071.5 & balanced\_need \\
-3 & 1060.1 & \textbf{1070.3} & 1068.6 & balanced\_need \\
-4 & 1060.4 & 1067.8 & \textbf{1068.1} & urgency\_greedy \\
-5 & 1058.0 & \textbf{1067.4} & 1054.3 & balanced\_need \\
-6 & 1054.7 & \textbf{1066.3} & 1054.5 & balanced\_need \\
-7 & 1051.1 & \textbf{1065.2} & 1053.2 & balanced\_need \\
-8 & 1051.5 & \textbf{1065.0} & 1053.3 & balanced\_need \\
-9 & 1052.3 & \textbf{1067.0} & 1065.5 & balanced\_need \\
+1 & 1079.5 & 1077.5 & \textbf{1084.3} & urgency\_greedy \\
+2 & 1067.2 & 1068.0 & \textbf{1070.3} & urgency\_greedy \\
+3 & 1061.5 & 1064.3 & \textbf{1068.6} & urgency\_greedy \\
+4 & 1060.4 & 1062.1 & \textbf{1068.3} & urgency\_greedy \\
+5 & 1057.9 & \textbf{1062.3} & 1054.2 & balanced\_need \\
+6 & 1054.6 & \textbf{1061.9} & 1052.1 & balanced\_need \\
+7 & 1050.5 & \textbf{1060.9} & 1057.8 & balanced\_need \\
+8 & 1050.8 & \textbf{1060.7} & 1055.3 & balanced\_need \\
+9 & 1051.8 & 1062.8 & \textbf{1063.4} & urgency\_greedy \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Result: \texttt{balanced\_need} wins 7 of the 9 draft slots}, with \texttt{urgency\_greedy}
-narrowly ahead at slots 1 and 4 — by 0.2 and 0.3 points respectively, out of $\sim$1070-1080
-total (well under 0.1\%), i.e.\ a practical statistical tie at those two slots rather than a
-robust preference. (Re-scoring goalie shutouts as additive, Section~\ref{sec:scoring}, raised
-goalie value enough to flip these two slots from the prior run; the other 7 are unaffected and
-still decisive.) Evenly pacing forward/defense/goalie picks against their final roster targets
-throughout the draft outperformed both chasing raw best-available value (\texttt{value\_greedy},
-which loads up on forwards early since their absolute values are highest, then scrambles for
-defense and goalies late) and pure scarcity-chasing (\texttt{urgency\_greedy}, which front-loads
-defense/goalie but can overcorrect) at 7 of 9 slots, and is essentially tied with scarcity-chasing
-at the other 2. \texttt{balanced\_need} remains the recommended default for this pool given its
-consistency and its deterministic, easy-to-follow recommendations (see below).
+\textbf{Result: the winning policy now splits by draft position.} \texttt{urgency\_greedy} wins
+slots 1--4 and slot 9 (five of nine), decisively at slots 1--4 (2.3--6.8 points ahead of the
+runner-up) but only barely at slot 9 (1063.4 vs.\ 1062.8, a 0.6-point practical tie).
+\texttt{balanced\_need} wins slots 5--8 (four of nine), also decisively (3.1--7.3 points ahead).
+\texttt{value\_greedy} never wins any slot. This is a genuinely different, more nuanced picture
+than a single universal recommendation: early slots (1--4) wait the longest for their next pick
+under snake-draft reversal, where \texttt{urgency\_greedy}'s explicit modeling of opponent
+scarcity erosion in that gap pays off; mid-table slots (5--8) have more evenly-spaced picks,
+where \texttt{balanced\_need}'s simpler even-pacing heuristic is enough. Slot 9 (the last pick of
+each odd round, immediately followed by the first pick of the next even round) is a genuine
+toss-up between the two. \textbf{Recommendation: use \texttt{urgency\_greedy} at slots 1--4,
+\texttt{balanced\_need} at slots 5--8, and either at slot 9} — \texttt{live\_draft.py} already
+looks up the per-slot winner from this table automatically (`policy\_comparison.csv`).
 
-\subsection{Recommended ordering example (draft slot 5)}
+\subsection{Full recommended draft order — all 9 slots}
+\label{sec:allslots}
 
-Table~\ref{tab:slot5} shows \texttt{balanced\_need}'s round-by-round recommendation for draft
-slot 5 (the same table is generated for all 9 slots in \texttt{results/draft/round\_priority\_
-slot\_<1-9>.csv}) — slot 5 is used here rather than slot 4 because \texttt{balanced\_need} only
-narrowly (and non-robustly, see Table~\ref{tab:policywinner}) wins slot 4, while it decisively
-wins slot 5. Because \texttt{balanced\_need} depends only on the user's own roster fill state,
-not on opponents' choices, its recommendation is deterministic (100\% confidence) at every round
-for a given slot — unlike \texttt{urgency\_greedy}, which estimates opponent behavior and is
-occasionally less than 100\% confident in its own recommendation.
+Rather than one representative slot, Table~\ref{tab:allslots} lays out the full round-by-round
+recommended position for every draft slot side by side — a complete reference, and also the
+clearest way to see the pattern across the whole pool at a glance.
 
-\begin{table}[h]
+\textbf{Lessons learned from the full grid} (updated 2026-08-25 after fixing the
+starters-before-bench draft mechanic described above — the previous version of this table let
+the simulation illegally draft a 2nd goalie as early as round 11, which materially changed both
+the policy comparison and the shape of the recommendations below):
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Every slot now hits exactly the required 7F/3D/1G starter mix by round 11, no
+        exceptions} — this is the fix itself made visible: columns 1--9, rows 1--11 always sum to
+        7 forwards, 3 defense, 1 goalie, whichever policy wins that slot. The old, buggy grid
+        showed a 2nd goalie inside the first 11 picks at several slots; that can no longer happen.
+  \item \textbf{Which policy wins now genuinely depends on where you pick, not a single universal
+        answer.} \texttt{urgency\_greedy} wins slots 1--4 and 9 (Table~\ref{tab:policywinner}) —
+        decisively at 1--4, since those slots wait the longest for their next pick under
+        snake-draft reversal, where explicitly modeling opponent scarcity erosion pays off.
+        \texttt{balanced\_need} wins slots 5--8, where picks are more evenly spaced and simple
+        pacing is enough. The four \texttt{balanced\_need} slots (5, 6, 7, 8) still share one
+        identical sequence, \texttt{F D G F F D F F D F F G D F F D F} at 100\% confidence — a
+        single memorable recipe, but now only for those four slots, not seven. Slots 3 and 4
+        (both \texttt{urgency\_greedy}) also converge on nearly the same sequence as each other;
+        slots 1, 2, and 9 each diverge more, and slot 1 in particular is noticeably less certain
+        (confidence dips as low as 54\%), since \texttt{urgency\_greedy} is estimating opponent
+        behavior rather than reacting only to the user's own roster.
+  \item \textbf{The 2nd goalie's timing is the clearest behavioral difference between the two
+        policies.} Under \texttt{balanced\_need} (slots 5--8) it's taken at round 12 — the
+        earliest legal bench pick, immediately once the bench phase opens. Under
+        \texttt{urgency\_greedy} it's pushed much later — round 14 at slots 2--4, round 15 at
+        slot 1, round 16 at slot 9 — because by then the 1st-goalie scarcity pressure that drove
+        the early pick (secured by round 2--3 everywhere, well ahead of the \#18 cutoff and its
+        36\% post-cutoff cliff, Table~\ref{tab:scarcity}) has already been resolved, and a bench
+        goalie carries little further urgency. Forwards remain the deepest, most cushioned
+        position and dominate the back half of the draft regardless of policy.
+\end{itemize}
+
+\begin{table}[H]
 \centering
-\caption{Recommended draft order — slot 5 (balanced\_need policy)}
-\label{tab:slot5}
-\begin{tabular}{rrl}
+\caption{Full recommended draft order by round, all 9 slots (F=forward, D=defense, G=goalie)}
+\label{tab:allslots}
+\setlength{\tabcolsep}{4.5pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{r *{9}{c}}
 \toprule
-Round & Overall pick & Recommended position \\
+Round & \multicolumn{9}{c}{Slot} \\
+ & 1 & 2 & 3 & 4 & 5 & 6 & 7 & 8 & 9 \\
 \midrule
-1  & 5   & Forward \\
-2  & 14  & Defense \\
-3  & 23  & Goalie \\
-4  & 32  & Forward \\
-5  & 41  & Forward \\
-6  & 50  & Defense \\
-7  & 59  & Forward \\
-8  & 68  & Forward \\
-9  & 77  & Defense \\
-10 & 86  & Forward \\
-11 & 95  & Goalie \\
-12 & 104 & Forward \\
-13 & 113 & Defense \\
-14 & 122 & Forward \\
-15 & 131 & Forward \\
-16 & 140 & Defense \\
-17 & 149 & Forward \\
+1 & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D & \cellcolor{defcolor}D$^*$ & \cellcolor{defcolor}D$^*$ & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
+2 & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G$^*$ & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{goalcolor}G$^*$ \\
+3 & \cellcolor{goalcolor}G$^*$ & \cellcolor{goalcolor}G$^*$ & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G & \cellcolor{fwdcolor}F \\
+4 & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D$^*$ & \cellcolor{defcolor}D$^*$ & \cellcolor{defcolor}D$^*$ & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D$^*$ \\
+5 & \cellcolor{defcolor}D$^*$ & \cellcolor{fwdcolor}F$^*$ & \cellcolor{fwdcolor}F$^*$ & \cellcolor{fwdcolor}F$^*$ & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
+6 & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D$^*$ \\
+7 & \cellcolor{defcolor}D & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
+8 & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D$^*$ \\
+9 & \cellcolor{defcolor}D & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{fwdcolor}F \\
+10 & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
+11 & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
+12 & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D & \cellcolor{defcolor}D$^*$ & \cellcolor{defcolor}D & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G & \cellcolor{defcolor}D \\
+13 & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D$^*$ & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{fwdcolor}F \\
+14 & \cellcolor{fwdcolor}F & \cellcolor{goalcolor}G & \cellcolor{goalcolor}G$^*$ & \cellcolor{goalcolor}G & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D$^*$ \\
+15 & \cellcolor{goalcolor}G$^*$ & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
+16 & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{defcolor}D & \cellcolor{goalcolor}G$^*$ \\
+17 & \cellcolor{defcolor}D$^*$ & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F & \cellcolor{fwdcolor}F \\
 \bottomrule
-\end{tabular}
+\end{tabular}}
+
+\vspace{4pt}
+{\footnotesize \colorbox{fwdcolor}{\phantom{F}}~Forward\quad
+  \colorbox{defcolor}{\phantom{F}}~Defense\quad \colorbox{goalcolor}{\phantom{F}}~Goalie\quad
+  $^*$below 100\% simulated confidence (slots 5--8 are 100\% throughout; slots 1--4 and 9 vary,
+  see text)\par}
 \end{table}
 
-The pattern generalizes across slots: secure a goalie early (well before the \#18 cutoff, given
-the 36\% post-cutoff cliff), interleave defense roughly every 2-3 forward picks rather than
-saving it for a dedicated run, and let forwards — the deepest, most cushioned position — fill
-the remaining picks as they come up.
+Exact overall pick numbers per slot (which differ due to snake-draft math even where the position
+sequence is identical) remain in \texttt{results/draft/round\_priority\_slot\_<1-9>.csv}, one file
+per slot, as generated by \texttt{draft\_strategy.py}.
 
 \subsection{Usage and outputs}
 
 \begin{lstlisting}[language=bash]
-python3 draft_strategy.py --season 2026-27               # all 9 slots
-python3 draft_strategy.py --season 2026-27 --my-slot 5    # + slot-5 table path printed
+python3 draft_strategy.py --season 2026-27              # all 9 slots
+python3 draft_strategy.py --season 2026-27 --my-slot 5   # + slot-5 table
 \end{lstlisting}
 
 Writes to \texttt{results/draft/}: \texttt{value\_curves.csv} (full F/D/G curves),

@@ -104,7 +104,7 @@ python3 -m pip install -r requirements.txt
    ```
    Then type `pick <player name>` for every pick as it's announced (yours and every opponent's —
    this pool's draft is manual/verbal, so there's nothing to pull picks from automatically).
-   Type `help` inside the tool for the full command list (`show`, `top`, `undo`, `quit`). State
+   Type `help` inside the tool for the full command list (`show`, `top`, `sleepers`, `undo`, `quit`). State
    saves after every pick, so if you close the terminal or the laptop sleeps, just re-run the
    same command to pick up exactly where you left off.
 
@@ -497,6 +497,105 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
     example invocations for all three CLI tools (`run_season.py`, `draft_strategy.py`,
     `live_draft.py`). The tex/PROJECT.md folder-layout listings were also updated to include
     `live_draft.py` and the three new `common/draft/live_*.py` modules, which were missing.
+  - **2026-08-25 (later still) — full 9-slot draft-order table**: replaced §12.5's single-slot
+    example table with a complete round × slot grid covering all 9 possible draft positions
+    (color-coded by position, built from `results/draft/round_priority_slot_<1-9>.csv`, no new
+    computation needed) plus new "Lessons learned" prose. Key finding worth remembering: the
+    recommended position sequence is identical across 7 of the 9 slots (2,3,5,6,7,8,9 — all
+    `F D G F F D F F D F G F D F F D F` at 100% confidence) — only slots 1 and 4 differ, the two
+    where `urgency_greedy` narrowly (near-statistical-tie) beats `balanced_need`. One mental
+    "recipe" effectively covers the whole pool. LaTeX note: the table needed `\usepackage{float}`
+    and `[H]` placement — `[h]`/`[ht]` let it drift all the way to the end of the document behind
+    other floats; `\usepackage[table]{xcolor}` (added the `table` option) was needed for
+    `\cellcolor`, and legend swatches needed `\colorbox` instead (`\cellcolor` only works inside
+    a `tabular` row, not in plain text).
+    **Superseded the same day** — see the "starters-before-bench" bug fix entry directly below:
+    the "7 of 9 slots identical" finding above was computed under a simulation bug (no
+    starters-before-bench constraint) and no longer holds as stated; the table/prose have since
+    been rebuilt on the corrected simulation.
+
+- **2026-08-25 (later still) — fixed missing starters-before-bench constraint in the draft
+  simulation** (`common/draft/pool_structure.py`, `strategy_sim.py`, `live_state.py`):
+  - **Bug, caught by the user**: reviewing the full 9-slot table above, the user noted the pool's
+    roster rule means the first 11 picks of any team must be *exactly* 7F/3D/1G (the starter
+    slots) before any of the 6 bench slots (3F/2D/1G) can be drafted — e.g. a 2nd goalie should
+    never be legal before round 12. The simulation's `_State.eligible()` (and the live tool's
+    identical `_LiveState.eligible()`) only checked the *combined* starters+bench cap per
+    position, with no such phase/round-range awareness — so it was letting recommendations
+    illegally draft a 2nd goalie as early as round 11 (verified by hand: slot 5's old sequence
+    had 6F/3D/1G by round 10, then recommended a 2nd goalie at round 11 instead of the still-open
+    7th forward — an illegal roster state under the real rule). This affected both
+    `draft_strategy.py`'s Monte Carlo simulation (opponents included, not just the user's own
+    policy choices) and `live_draft.py`'s real-time pick validation.
+  - **Fix**: `DraftConfig` (`pool_structure.py`) now retains the starters/bench split as
+    `starter_caps`/`bench_caps` (previously collapsed into a single combined `caps` at
+    `load_draft_config()`, discarding the information needed to enforce this). `eligible(team)`
+    in both `_State` and `_LiveState` now returns only starter-open positions
+    (`count[p] < starter_caps[p]`) while `sum(counts) < sum(starter_caps)` (i.e. while any of the
+    11 starter slots remain unfilled), and falls back to the full combined-cap check once all 11
+    are filled. No changes needed to `_balanced_need`/`_urgency_greedy`/`_value_greedy` — they
+    only ever operate on the `eligible` list handed to them, confirming the fix is fully contained
+    to the two `eligible()` methods.
+  - **Re-ran `draft_strategy.py --season 2026-27` end-to-end** — results changed materially, not
+    just superficially: `urgency_greedy` now wins slots 1–4 and 9 (five of nine, decisively at
+    1–4: 2.3–6.8 pts ahead), `balanced_need` wins slots 5–8 (decisively: 3.1–7.3 pts ahead), and
+    slot 9 is a near-tie. Previously `balanced_need` had won 7 of 9. The 2nd goalie now correctly
+    lands at round 12 (`balanced_need` slots) or as late as round 14–16 (`urgency_greedy` slots,
+    once 1st-goalie scarcity pressure has already resolved) instead of the old, illegal round 11.
+    `docs/hockey_pool_pipeline.tex` §12.4 (opponent-model description, Table 7, Result paragraph)
+    and §12.5 (Table 8, Lessons learned) rewritten to match; PDF rebuilt.
+  - **Tests**: `tests/test_live_state.py`'s `dcfg` fixture updated for `DraftConfig`'s new
+    required fields (`starter_caps=caps, bench_caps={p:0...}` preserves the existing 12 tests'
+    behavior unchanged). Added a `dcfg_with_bench` fixture (real starter/bench split) plus 3 new
+    tests confirming: a position at its starter cap is ineligible during starter phase even with
+    bench capacity remaining; the last open starter category is correctly forced; bench phase
+    correctly unlocks all positions once all 11 starters are filled. All 25 tests pass.
+  - Verified `live_draft.py` end-to-end with a fresh scripted 153-pick mock draft — completes
+    cleanly, and every team's first-11-picks composition is exactly 7F/3D/1G in every simulated
+    slot (checked programmatically, not just visually). Also caught and fixed a follow-on UX bug
+    while testing the rejection path directly: `live_repl.py`'s rejection message always said
+    "already has a full {position} roster (cap N)" using the *combined* cap, which is wrong and
+    confusing for a starter-phase rejection (e.g. it said "cap 2" for a goalie when the team only
+    had 1 — the real block was the starter cap of 1, not the combined cap). Now distinguishes
+    "starter slot(s) already full, bench isn't open yet" from "full roster" correctly.
+  - Separately, re-audited the whole repo for stale "3 total, not additive" goalie-shutout-scoring
+    phrasing (the user re-confirmed the 4-total additive rule after I flagged that the original
+    `2025-26/instructions_for_claude_6Sept25.docx` still reads the old way) — every currently
+    maintained file (`pool_ranking.py`, `config.yaml`, `goalies.py`, this file, the tex/PDF doc)
+    was already consistent; only the frozen `2025-26/` legacy scripts and the historical `.docx`
+    still show the old wording, left as-is since both are explicitly historical reference
+    material, not part of the maintained pipeline.
+
+- **2026-08-25 (later still) — breakout / "dark horse" score** (`common/models/pool_ranking.py`):
+  - User asked whether a late-round-sleeper detection strategy could be added. Answer: yes,
+    entirely from data already flowing through the pipeline — no new scraping, no training
+    changes. New `breakout_score` (continuous) and `dark_horse` (boolean) columns on every
+    ranking output (`finalpool_*_{forward,defense,goalie,overall}_rankings.csv`).
+  - Two signals, z-scored within position and averaged: (1) model-vs-history divergence
+    (`pred - *_hist_avg`, the same reference column the defense blend already uses); (2) an
+    underlying-metric regression-candidate signal — MoneyPuck individual xGoals minus actual
+    goals (skaters; already joined/auto-lagged) or `gsax_hist_avg` directly (goalies, already
+    skill-adjusted). `dark_horse` requires `breakout_score > 1.0` *and* predicted rank outside an
+    already-good cutoff (>30 forward, >15 defense, >8 goalie) so an already-elite player trending
+    up doesn't get flagged.
+  - Re-ran `--stage predict` (no retrain needed, purely additive post-prediction scoring) —
+    output looks sensible: the very top of the rankings (MacKinnon, Kucherov, Draisaitl) scores
+    strongly *negative* (expected — elite snipers reliably outscore their own xG, which this
+    formula can't distinguish from luck, and their model prediction sits below their own gaudy
+    historical average due to the known compression tendency), while flagged dark horses include
+    plausible real buy-low names (Zach Hyman, Timo Meier, Logan Thompson among goalies).
+  - Caveat documented in the tex doc: no ADP/consensus draft data exists anywhere in this
+    pipeline, so "late round" is proxied via the model's own predicted rank, not real draft-day
+    availability. `docs/hockey_pool_pipeline.tex` new §9.6; PDF rebuilt.
+  - **Wired into `live_draft.py` the same day** (`common/draft/live_repl.py`), per the user's
+    follow-up question about how this fits the actual pick-choosing workflow. No data-layer
+    change needed — `LivePool` already wraps the rankings CSV, which now carries these columns.
+    A 🔥 marker annotates `dark_horse` players inline in every "top available" listing
+    (recommendation panel and `top`); a new `sleepers [position] [n]` command shows a
+    dark-horse-only view, sorted by `breakout_score`, available at any point (no round-based
+    gating — user's choice over auto-surfacing at bench phase). Verified live: `sleepers forward
+    5`/`sleepers` (all positions) correctly filtered/sorted; `top forward 90` showed the 🔥
+    marker on real flagged players (Zach Hyman, Jackson Blake) at their actual rank position.
 
 ## Future milestones (not in scope for the 2026-27 rebuild)
 
