@@ -38,7 +38,14 @@ run_season.py       CLI entry point: python run_season.py --season 2026-27 --sta
   plots/                 diagnostics (gitignored)
   results/diagnostics/   source_reconciliation.csv, model_metrics.csv
   plots/diagnostics/     pva_*.png (predicted-vs-actual + residuals per model)
+  results/draft/         draft-strategy curves, policy comparison, round tables (gitignored)
 ```
+
+`draft_strategy.py` (repo root) is a separate CLI entry point: `python draft_strategy.py --season
+2026-27 [--my-slot 1-9]`, backed by `common/draft/` (historical_scoring.py, historical_value_curves.py,
+pool_structure.py, strategy_sim.py, report.py). It answers a different question from the rankings
+pipeline above — not "which players," but "in what order should positions be drafted" — and reads
+the rankings pipeline's outputs without modifying it.
 
 `2025-26/` is last year's original ad-hoc build (24 near-duplicate model scripts, no shared
 library, nothing persisted, no git tracking). It's kept as historical reference only — not
@@ -51,8 +58,8 @@ season's `config.yaml` under `scoring:`.
 
 - Forwards: goals + assists
 - Defense: goals + assists + plus/minus
-- Goalies (min 40 GP to qualify for bonuses): 1 pt/win, 3 pts total for a shutout win
-  (not additive on top of the win point), +10 for best GAA among qualified goalies,
+- Goalies (min 40 GP to qualify for bonuses): 1 pt/win, +3 bonus for a shutout win
+  (additive on top of the win point — 4 total), +10 for best GAA among qualified goalies,
   +10 for best save % among qualified goalies
 
 ## Known modeling limitations (as of 2026-07-24)
@@ -64,11 +71,15 @@ season's `config.yaml` under `scoring:`.
   awarded to whoever scores highest/lowest, so even a weak model's ranking at the top is
   informative. But this should be revisited: consider predicting the percentile rank rather
   than the raw stat, or switching to a simpler "stability-weighted career average" baseline.
-- **Defense plus/minus OOS R²=0.031**: essentially random out-of-sample (OOS concordance ~0.54,
-  barely above the 0.50 chance baseline). Contemporaneous team features were removed — they are
-  NaN at prediction time, causing a training/inference mismatch. Prediction blending (alpha=0.10
-  toward 2-year historical averages) corrects ranking at the extremes. The model adds weak signal
-  as a prior; worth exploring true joint points+plus/minus estimation (see Future).
+- **Defense plus/minus**: now modeled as a residual after removing the points contribution
+  (2026-08-25, see changelog) — OOS R² improved 0.031→0.145, concordance ~0.54→~0.64 on the
+  residual target itself. Still comparatively weak: contemporaneous team features were removed
+  (NaN at prediction time, training/inference mismatch), and the residual formulation is an
+  approximation, not an exact accounting identity (NHL plus/minus excludes power-play goals,
+  points doesn't). Prediction blending (alpha=0.15 toward 2-year historical averages, recalibrated
+  2026-08-25 from the *reconstructed* prediction's own OOS concordance ~0.57 — lower than the
+  residual target's 0.64 alone, since errors from the independently-fit points and residual
+  models compound when summed) corrects ranking at the extremes.
 - **Traded players — team context**: players who changed teams during a historical season are
   assigned the *first* team listed in the NHL API's comma-joined `team_abbrev`. Their season
   totals (goals, assists, games_played) are preserved correctly; only the team-context features
@@ -83,7 +94,9 @@ season's `config.yaml` under `scoring:`.
 - Defense predictions are blended with 2-year historical averages to correct model compression
   at the extremes; all features are strictly lagged (no contemporaneous leakage). Blend weights
   (alpha) are calibrated from OOS concordance: `alpha = 2*(concordance − 0.5)` — alpha=0.45 for
-  points (concordance ~0.72), alpha=0.10 for plus_minus (concordance ~0.54). See `pool_ranking._blend()`.
+  points (concordance ~0.72), alpha=0.15 for plus_minus (concordance ~0.57, computed on the
+  reconstructed residual+points prediction, not the residual target's own ~0.64 — see the
+  2026-08-25 changelog entry). See `pool_ranking._blend()`.
 - Validation methodology: train on all data vs. train excluding the most recent season and
   check against it out-of-sample; the better-performing approach per position/target is used
   for the final prediction.
@@ -286,34 +299,108 @@ Prospects, and unused NHL API endpoints, constrained to **free sources only**. D
     MacKinnon (F), Kucherov (F), McDavid (F), Makar (D), Draisaitl (F),
     Pastrnak (F), Bouchard (D), Suzuki (F), Necas (F), Celebrini (F).
 
+- **2026-08-24 — Draft position-order strategy tool** (`common/draft/`, `draft_strategy.py`):
+  - Answers a question distinct from player rankings: given the pool's 9-team snake draft and
+    roster rules (7F/3D/1G starters + 3F/2D/1G bench=IR per team — bench/IR counted at full value
+    since it's substitutable into the lineup twice a week, unlimited for injuries), in what order
+    should *positions* (not specific players) be drafted? Deliberately player-identity-free; the
+    live, player-tracking draft-day assistant (P6 below) remains separately deferred.
+  - Value curves per position (F/D/G) are built from **18 real NHL seasons (2008-09..2025-26)**,
+    scored under the pool's exact rules by reusing `pool_ranking.compute_pool_points()` unchanged
+    (only the input columns are adapted from historical actuals). Three non-82-game seasons
+    (2012-13 lockout: 48 GP; 2019-20 COVID: ~70 GP; 2020-21 COVID: 56 GP) are rescaled to an
+    82-game-equivalent pace, which also proportionally scales the goalie bonus-qualification
+    threshold so a goalie who played every game of a shortened season isn't penalized against the
+    fixed 40-GP bar. Historical curve shape cross-checked against the current 2026-27 projections:
+    normalized-shape Pearson r = 1.00 (forward), 1.00 (defense), 0.95 (goalie).
+  - Monte Carlo simulation (1,500 drafts/policy/slot) compares three candidate drafting policies
+    — naive best-value, need-balanced pacing, and scarcity/urgency-aware — against opponents
+    modeled as best-player-available-among-remaining-needs.
+  - **Result: the need-balanced pacing policy (spread F/D/G picks proportional to final roster
+    targets throughout the draft) won for all 9 draft slots**, beating both naive best-value and
+    pure scarcity-chasing. Scarcity findings: goalies have only a 51% value drop across the whole
+    draftable range but a steep 37% further cliff in the 15 picks just past the cutoff (secure a
+    goalie early); defense drops steepest overall (61%) but has more cushion past its cutoff
+    (17%); forwards are safely deferrable (7% cushion past cutoff).
+  - Full writeup with tables: `docs/hockey_pool_pipeline.tex` §12 "Draft Position-Order Strategy".
+
+- **2026-08-25 — Goalie shutout scoring fix, observation weighting, joint models** (model-fit
+  pass preceding the deferred P3 interactive draft-day tool; see Future milestones below):
+  - **Scoring bug fix**: the goalie shutout bonus was implemented as "3 points total for a
+    shutout win" (not additive on top of the win point) — this was the documented rule, but the
+    user confirmed the real pool rule is additive: 1 (win) + 3 (shutout bonus) = **4 total**.
+    Fixed in `compute_pool_points()` (`pool_ranking.py`): `win_pts * wins + sut_pts * shutouts`
+    (was `win_pts * (wins - shutouts) + sut_pts * shutouts`). Verified: a goalie with 10 wins (3
+    shutouts) now scores 19 pts (7×1 + 3×4), not the old 16. `historical_scoring.py` reuses this
+    function unchanged, so the draft-strategy value curves picked up the fix automatically —
+    re-ran `draft_strategy.py` and updated `docs/hockey_pool_pipeline.tex` §12 accordingly (see
+    below).
+  - **P1 (observation weighting)**: threaded an optional `sample_weight` through `_fit_one()`,
+    `train_and_select()`, and `train_all_vs_exclude_latest()` in `training.py` (goalies only;
+    `defense.py`/`forwards.py` unaffected). Goalie `build_xy_for()` computes
+    `weight = min(GP, 40) / 40`. Weight affects only the estimator `.fit()` call (via
+    `search.fit(X_tr, y_tr, sample_weight=...)`); `SelectKBest` feature selection and reported
+    test/OOS metrics stay unweighted for comparability. Result: goalie GAA OOS R² −0.203 → −0.062,
+    concordance now 0.53 (real ranking signal). Save% OOS R² −0.839 → −0.406, but remained a
+    degenerate constant predictor (rank metrics undefined) — didn't suffice alone, triggering P2.
+  - **P2 (joint GAA/save% model)**: added `MultiTaskElasticNetCV` as an additional per-target
+    candidate in `goalies.py` (`_fit_joint_gaa_save_pct` / `_joint_train_all_vs_exclude`), fit
+    on the full (unweighted — MultiTaskElasticNet doesn't support `sample_weight`) feature set
+    with shared sparsity across GAA and save% (r=−0.84 algebraic link). Each task's output column
+    is wrapped in a `_JointTaskEstimator` proxy so it slots into an ordinary `TrainedModel`
+    (persistence/plotting/`pool_ranking.py` prediction call sites unchanged). Chosen per-target
+    only if it beats the single-task model's `selection_score`. Result: won for save% — test R²
+    −0.221 → −0.046 (now beats baseline), OOS R² −0.406 → −0.185, concordance 0.52 (was
+    undefined). GAA kept its single-task (P1-weighted) model, which already won there.
+  - **P3 (joint D-men model, residual-after-points)**: `defense.py`'s `plus_minus` target
+    replaced with `plus_minus_residual_per_game = plus_minus_per_game - points_per_game`,
+    trained via the existing single-target harness (no harness changes needed — lagged/historical
+    points features were already legitimate plus_minus-model inputs). `pool_ranking.py`
+    reconstructs the full prediction (`pred_plus_minus_residual + pred_points`) before the
+    existing hist-avg blend. Approximation, not an exact identity (NHL plus/minus excludes
+    power-play goals, points doesn't) — noted in `defense.py`'s docstring. Result: OOS R² 0.031 →
+    0.145, concordance ~0.54 → 0.64. Top D-men rankings still hockey-plausible post-fix (Makar #1,
+    Bouchard #2, Hutson #3) — see `[[defense_dmen_undervalued]]` memory, this was a recurring
+    concern and didn't regress.
+  - **Blend alpha recalibration**: the plus_minus blend alpha was still hardcoded at 0.10
+    (calibrated pre-P3, from the raw target's ~0.54 concordance). Recomputed properly post-P3:
+    the *reconstructed* prediction (`pred_plus_minus_residual + pred_points`, using genuine OOS
+    exclude-latest-season predictions from both underlying models) has its own OOS concordance
+    of only ~0.57 against actual plus_minus_per_game — lower than the residual target's own 0.64,
+    because prediction errors from the two independently-fit models (points, residual) compound
+    when summed. `alpha = 2*(0.57-0.5) ≈ 0.15` (was 0.10). Updated in `pool_ranking.py`.
+  - Persisted model key renamed `defense_plus_minus` → `defense_plus_minus_residual`
+    (`pool_ranking.py`'s `_load_or_train` specs, `model_report.py`'s `_FRIENDLY` display map); the
+    stale orphaned `defense_plus_minus.joblib` artifact was deleted.
+  - Re-ran `--stage train` (full retrain) and `draft_strategy.py` end-to-end; no pipeline errors.
+    The shutout fix raised goalie value enough to flip the winning draft policy at 2 of 9 slots
+    (slots 1 and 4 now favor `urgency_greedy` over `balanced_need`, by <0.5 pts out of ~1070-1080
+    — a practical statistical tie, not a robust preference); the other 7 slots are unaffected.
+    `docs/hockey_pool_pipeline.tex` §10.3, §11 (crosscheck/scarcity tables), and §12 (policy
+    table, result statement, and the round-by-round example — switched from slot 4 to slot 5
+    since slot 4 is no longer a clean `balanced_need` win) updated to match; PDF rebuilt.
+  - **Out of scope this pass** (per priority-ordered discussion): P4 (GP diagnostic Layer 2) —
+    no outstanding edge cases to fix; P5 (majority-team for traded players) — data-completeness
+    work, not model-fit; P6 (interactive draft-day tool) — deferred pending further discussion.
+
 ## Future milestones (not in scope for the 2026-27 rebuild)
 
-Listed in priority order.
+Listed in priority order. (P1-P3 from the prior list — observation weighting, joint GAA/save%,
+and the joint D-men model — are done; see the 2026-08-25 changelog entry above.)
 
-- **P1 — Observation weighting by games_played**: weight goalie training observations by
-  `min(GP, 40) / 40` to down-weight 1–5 start goalies who are pure noise. Requires threading
-  a `sample_weight` optional parameter through `_fit_one()`, `train_and_select()`, and
-  `train_all_vs_exclude_latest()` in `training.py`, and computing weights in goalie
-  `build_xy_for()`. Safe default=None preserves current behavior for all non-goalie callers.
-  *Most impactful remaining modeling task for goalies.*
-- **P2 — MultiTaskElasticNet for (GAA, save_pct)**: joint sparsity across the algebraically-linked
-  pair (r=−0.84); a feature is selected for both targets or neither. Use
-  `sklearn.linear_model.MultiTaskElasticNetCV`. Only worth implementing if P1 doesn't suffice —
-  the algebraic linkage already means single-target models share most of their signal.
-- **P3 — Joint D-men model**: defenseman points mechanically raise their plus/minus (a scored goal
-  is also a +1 event). Leakage and blending are now fixed; true multi-output regression (predicting
-  plus_minus residual after accounting for point contributions) remains future work. Medium effort;
-  primarily affects depth D-men where team-driven vs. personal contribution is most ambiguous.
-- **P4 — GP diagnostic Layer 2 (game-log debut-date confirmation)**: for any player whose debut
+- **P1 — GP diagnostic Layer 2 (game-log debut-date confirmation)**: for any player whose debut
   season has GP < 50, fetch the game log via the existing `get_player_game_log()` endpoint and
   check `min(gameDate)`. A first game after February 1 is definitively a late call-up rather than
   injury. Deferred because the GP < 25 threshold filter already handles all known cases; implement
   if edge cases emerge from `gp_projection_check.csv`.
-- **P5 — Majority-team for historical traded players**: game logs currently cover only the most
+- **P2 — Majority-team for historical traded players**: game logs currently cover only the most
   recent season. Expanding to full history (one API call per player per historical season) would
   assign each player to the team they played most games for, making team-context lag features more
   accurate for the ~5–10% of rows involving mid-season trades. High API cost for marginal gain.
-- **P6 — Interactive draft-day tool**: analyze and select players live during the draft. Lowest
-  priority per original spec; nothing built yet.
+- **P3 — Interactive draft-day tool (player-level, live)**: the position-order strategy piece is
+  now built (2026-08-24, see changelog above and `docs/hockey_pool_pipeline.tex` §12) — this
+  remaining item is narrower than originally scoped: a live tool that shows remaining available
+  *players* ranked by pool points during the actual draft, lets you mark picks as they happen,
+  and recomputes recommendations in real time. Needs further discussion before starting.
 - **2027-28 season**: copy `2026-27/config.yaml` → `2027-28/config.yaml`, update
   season/trade-override/roster-date fields, run `--stage all`. That's the full annual process.

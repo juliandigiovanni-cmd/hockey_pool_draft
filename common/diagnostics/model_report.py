@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 _FRIENDLY = {
     "forward_points":    "Fwd Points/G",
     "defense_points":    "Def Points/G",
-    "defense_plus_minus":"Def +/−/G",
+    "defense_plus_minus_residual":"Def +/−/G (resid)",
     "goalie_wins":       "Goalie Wins/G",
     "goalie_shutouts":   "Goalie SO/G",
     "goalie_gaa":        "Goalie GAA",

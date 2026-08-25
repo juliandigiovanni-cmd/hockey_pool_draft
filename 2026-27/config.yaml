@@ -43,7 +43,19 @@ scoring:
     plus_minus: 1
   goalies:
     win: 1
-    shutout_win: 3       # total for a shutout win (not additive on top of the win point)
+    shutout_win: 3       # bonus for a shutout win, additive on top of the win point (4 total)
     min_gp_for_bonus: 40
     best_gaa_bonus: 10
     best_save_pct_bonus: 10
+
+# Pool structure for draft_strategy.py (position-order draft strategy tool). Bench/IR is
+# combined with starters below since it's substitutable into the active lineup twice a week
+# (unlimited for injuries) and so contributes roughly full value.
+draft:
+  num_teams: 9
+  roster:
+    forward: {starters: 7, bench: 3}
+    defense: {starters: 3, bench: 2}
+    goalie: {starters: 1, bench: 1}
+  opponent_temperature: 1.5   # softmax noise for opponents' position choice; lower = more deterministic BPA
+  mc_sims: 1500               # Monte Carlo drafts simulated per policy per draft slot

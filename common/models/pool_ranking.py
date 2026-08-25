@@ -54,7 +54,7 @@ def _load_or_train(cfg: SeasonConfig, skater: pd.DataFrame, goalie: pd.DataFrame
     persisted joblib models. Validation results are only available on the training path.
     """
     specs = {"forward_points": (fwd, skater), "defense_points": (dfe, skater),
-             "defense_plus_minus": (dfe, skater),
+             "defense_plus_minus_residual": (dfe, skater),
              **{f"goalie_{t}": (goa, goalie) for t in goa.TARGETS}}
 
     models, validations = {}, {}
@@ -205,7 +205,7 @@ def compute_pool_points(cfg: SeasonConfig, fwd_df: pd.DataFrame, def_df: pd.Data
     shutouts = np.minimum(shutouts, wins)
     goal_df["predicted_wins"] = wins
     goal_df["predicted_shutouts"] = shutouts
-    goal_df["pool_points"] = win_pts * (wins - shutouts) + sut_pts * shutouts
+    goal_df["pool_points"] = win_pts * wins + sut_pts * shutouts
     goal_df["qualified"] = goal_df["projected_games"] >= min_gp
     goal_df["gaa_bonus"] = False
     goal_df["save_pct_bonus"] = False
@@ -332,17 +332,25 @@ def run_pool_ranking(cfg: SeasonConfig, retrain: bool = True) -> dict[str, pd.Da
     # Defense
     def_rows = _predict_rows(dfe.engineer, skater_aug, cfg)
     def_rows["pred_points_per_game"] = models["defense_points"].predict(def_rows)
-    def_rows["pred_plus_minus_per_game"] = models["defense_plus_minus"].predict(def_rows)
+    # plus_minus is modeled as a residual after the points contribution (see defense.py); add the
+    # points prediction back to reconstruct the full plus_minus_per_game before blending/scoring.
+    def_rows["pred_plus_minus_residual_per_game"] = models["defense_plus_minus_residual"].predict(def_rows)
+    def_rows["pred_plus_minus_per_game"] = (def_rows["pred_plus_minus_residual_per_game"]
+                                            + def_rows["pred_points_per_game"])
     def_rows["projected_games"] = def_rows["player_id"].map(skater_gp_map).fillna(70)
 
     # Blend model predictions with 2-year historical averages to correct compression at the top.
     # Alpha weights derived from OOS concordance: alpha = 2*(concordance - 0.5).
-    #   defense_points OOS concordance ~0.72  → alpha=0.45 (model trusted, hist corrects compression)
-    #   defense_plus_minus OOS concordance ~0.54 → alpha=0.10 (model barely beats chance; hist dominates)
+    #   defense_points OOS concordance ~0.72 → alpha=0.45 (model trusted, hist corrects compression)
+    #   defense_plus_minus (reconstructed = residual + points, 2026-08-25): the residual target's
+    #   own OOS concordance is ~0.64, but errors from the two independently-fit models (points,
+    #   residual) compound when summed — the RECONSTRUCTED quantity's own OOS concordance against
+    #   actual plus_minus_per_game is only ~0.57 (still an improvement over the pre-residual
+    #   model's ~0.54) → alpha=0.15.
     def_rows["pred_points_per_game"] = _blend(
         def_rows, "pred_points_per_game", "points_per_game_hist_avg", alpha=0.45)
     def_rows["pred_plus_minus_per_game"] = _blend(
-        def_rows, "pred_plus_minus_per_game", "plus_minus_per_game_hist_avg", alpha=0.10)
+        def_rows, "pred_plus_minus_per_game", "plus_minus_per_game_hist_avg", alpha=0.15)
 
     # Goalies
     goal_rows = _predict_rows(goa.engineer, goalie_aug, cfg)

@@ -116,7 +116,8 @@ def _make_cv(n: int, time_order: np.ndarray | None):
     return KFold(n_splits=folds, shuffle=True, random_state=42)
 
 
-def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndarray | None) -> dict:
+def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndarray | None,
+            sample_weight: pd.Series | None = None) -> dict:
     cfg = model_zoo()[model_type]
     scaler = None
     Xf = X
@@ -124,10 +125,14 @@ def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndar
         scaler = RobustScaler()
         Xf = pd.DataFrame(scaler.fit_transform(X), columns=X.columns, index=X.index)
 
+    w = sample_weight.loc[X.index] if sample_weight is not None else None
+
     order = None
     if time_order is not None:
         order = np.argsort(time_order, kind="stable")
         Xf, y = Xf.iloc[order], y.iloc[order]
+        if w is not None:
+            w = w.iloc[order]
 
     test_size = min(0.25, max(0.15, 40 / len(Xf)))
     # For time-ordered data, hold out the most recent block; otherwise random split.
@@ -135,8 +140,14 @@ def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndar
         split = int(len(Xf) * (1 - test_size))
         X_tr, X_te, y_tr, y_te = Xf.iloc[:split], Xf.iloc[split:], y.iloc[:split], y.iloc[split:]
         cv_order = np.sort(time_order)[:split]
+        w_tr = w.iloc[:split] if w is not None else None
     else:
-        X_tr, X_te, y_tr, y_te = train_test_split(Xf, y, test_size=test_size, random_state=42)
+        if w is not None:
+            X_tr, X_te, y_tr, y_te, w_tr, _ = train_test_split(
+                Xf, y, w, test_size=test_size, random_state=42)
+        else:
+            X_tr, X_te, y_tr, y_te = train_test_split(Xf, y, test_size=test_size, random_state=42)
+            w_tr = None
         cv_order = None
 
     cv = _make_cv(len(X_tr), cv_order)
@@ -146,7 +157,10 @@ def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndar
                                     random_state=42, **common)
     else:
         search = GridSearchCV(cfg["model"], cfg["params"], **common)
-    search.fit(X_tr, y_tr)
+    if w_tr is not None:
+        search.fit(X_tr, y_tr, sample_weight=w_tr.to_numpy())
+    else:
+        search.fit(X_tr, y_tr)
 
     est = search.best_estimator_
     y_pred = est.predict(X_te)
@@ -169,11 +183,14 @@ def _fit_one(X: pd.DataFrame, y: pd.Series, model_type: str, time_order: np.ndar
 def train_and_select(X: pd.DataFrame, y: pd.Series, target: str,
                      time_order: pd.Series | np.ndarray | None = None,
                      model_types: tuple[str, ...] = DEFAULT_MODEL_TYPES,
-                     max_features: int = 50) -> TrainedModel:
+                     max_features: int = 50,
+                     sample_weight: pd.Series | None = None) -> TrainedModel:
     """Feature-select, tune every algorithm, and return the winner by `selection_score`.
 
     time_order (e.g. the season year per row) enables TimeSeriesSplit CV and a most-recent
-    hold-out; pass None to fall back to shuffled KFold.
+    hold-out; pass None to fall back to shuffled KFold. sample_weight (optional, indexed like X)
+    weights each row's contribution to the estimator fit only — feature selection and reported
+    metrics stay unweighted so they remain comparable to the unweighted baseline.
     """
     if len(X) < 20:
         raise ValueError(f"Insufficient data to train {target}: {len(X)} rows")
@@ -189,7 +206,7 @@ def train_and_select(X: pd.DataFrame, y: pd.Series, target: str,
     best = None
     for mt in model_types:
         try:
-            res = _fit_one(X, y, mt, order)
+            res = _fit_one(X, y, mt, order, sample_weight=sample_weight)
         except Exception as e:
             logger.warning("Model %s failed for target %s: %s", mt, target, e)
             continue
@@ -239,22 +256,26 @@ def train_all_vs_exclude_latest(build_xy_fn, df: pd.DataFrame, target: str, cfg:
 
     Trains model (a) on all seasons and model (b) excluding the latest season, then scores (b)
     out-of-sample on that held-out season. `build_xy_fn(frame) -> (X, y, time_order)` lets each
-    position supply its own leakage rules. Returns both models, the OOS metrics for (b), and a
-    `chosen` key naming the model to use for production prediction (the higher selection_score).
+    position supply its own leakage rules; a position may optionally return a 4th element,
+    `sample_weight` (e.g. goalies weighting by GP), which is threaded into `train_and_select`.
+    Returns both models, the OOS metrics for (b), and a `chosen` key naming the model to use for
+    production prediction (the higher selection_score).
     """
     latest = int(df["year"].max())
-    X_all, y_all, order_all = build_xy_fn(df)
-    model_all = train_and_select(X_all, y_all, target, time_order=order_all, **train_kwargs)
+    X_all, y_all, order_all, *w_all = build_xy_fn(df)
+    model_all = train_and_select(X_all, y_all, target, time_order=order_all,
+                                 sample_weight=(w_all[0] if w_all else None), **train_kwargs)
 
     out = {"latest_year": latest, "all": model_all, "exclude_latest": None, "oos": None}
 
     df_excl = df[df["year"] < latest]
     if df_excl["year"].nunique() >= 2:
-        X_ex, y_ex, order_ex = build_xy_fn(df_excl)
-        model_ex = train_and_select(X_ex, y_ex, target, time_order=order_ex, **train_kwargs)
+        X_ex, y_ex, order_ex, *w_ex = build_xy_fn(df_excl)
+        model_ex = train_and_select(X_ex, y_ex, target, time_order=order_ex,
+                                    sample_weight=(w_ex[0] if w_ex else None), **train_kwargs)
         out["exclude_latest"] = model_ex
 
-        X_oos, y_oos, _ = build_xy_fn(df[df["year"] == latest])
+        X_oos, y_oos, *_ = build_xy_fn(df[df["year"] == latest])
         if len(X_oos) > 0:
             pred = model_ex.predict(X_oos)
             y_arr, p_arr = np.asarray(y_oos), pred
@@ -300,9 +321,10 @@ def rolling_oos_eval(build_xy_fn, df: pd.DataFrame, target: str, cfg: SeasonConf
         train_df = df[df["year"] < holdout_year]
         oos_df = df[df["year"] == holdout_year]
         try:
-            X_tr, y_tr, order_tr = build_xy_fn(train_df)
-            model = train_and_select(X_tr, y_tr, target, time_order=order_tr, **train_kwargs)
-            X_oos, y_oos, _ = build_xy_fn(oos_df)
+            X_tr, y_tr, order_tr, *w_tr = build_xy_fn(train_df)
+            model = train_and_select(X_tr, y_tr, target, time_order=order_tr,
+                                     sample_weight=(w_tr[0] if w_tr else None), **train_kwargs)
+            X_oos, y_oos, *_ = build_xy_fn(oos_df)
             if len(X_oos) < 2:
                 continue
             pred = model.predict(X_oos)

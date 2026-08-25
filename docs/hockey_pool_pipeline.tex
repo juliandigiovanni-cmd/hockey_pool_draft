@@ -84,8 +84,8 @@ Defense   & Goal                             & 1 \\
           & Assist                           & 1 \\
           & Plus/minus                       & 1 per unit \\
 \midrule
-Goalies   & Win (non-shutout)                & 1 \\
-          & Shutout win (total, not additive)& 3 \\
+Goalies   & Win                              & 1 \\
+          & Shutout win bonus (additive; 4 total)& 3 \\
           & Best GAA among $\geq$40 GP qualifiers & +10 \\
           & Best save\% among $\geq$40 GP qualifiers & +10 \\
 \bottomrule
@@ -132,15 +132,23 @@ common/               shared library, reused every season
   diagnostics/
     reconcile.py          cross-source reconciliation (NHL API vs MoneyPuck)
     model_report.py       metrics table, PvA plots, rolling OOS plot
+  draft/
+    historical_scoring.py     scores 18 seasons of actuals under pool rules
+    historical_value_curves.py  aggregates seasons into F/D/G value curves
+    pool_structure.py         snake-draft pick math, roster caps
+    strategy_sim.py           Monte Carlo position-order policy comparison
+    report.py                 writes draft-strategy CSVs/report
   pipeline.py             stage orchestration (scrape/clean/train/predict)
 
-run_season.py         CLI entry point
+run_season.py         CLI entry point (rankings pipeline)
+draft_strategy.py     CLI entry point (draft position-order strategy)
 
 <season>/             one directory per draft year, e.g. 2026-27/
   config.yaml           season parameters and scoring rules
   data/{raw,processed}/ scraped + cleaned data (gitignored)
   models/               persisted joblib artifacts (gitignored)
   results/              rankings, XLSX, report, diagnostics CSV (gitignored)
+  results/draft/        draft-strategy curves, policy comparison, round tables (gitignored)
   plots/                PvA and rolling-OOS plots (gitignored)
 \end{lstlisting}
 
@@ -451,6 +459,33 @@ overfitting:
 A model with a high train $R^2$ but poor test $R^2$ is penalised. The algorithm with the
 highest selection score is chosen as the production model for each target.
 
+\subsection{Observation weighting and joint-target candidates}
+\label{sec:weighting}
+
+Two extensions to the shared harness, both scoped to goalies (see Section~\ref{sec:goalies}),
+were added 2026-08-25:
+
+\textbf{Observation weighting.} An optional \texttt{sample\_weight} parameter threads through
+\texttt{\_fit\_one()}, \texttt{train\_and\_select()}, and \texttt{train\_all\_vs\_exclude\_latest()}
+(default \texttt{None} preserves prior behaviour for every non-goalie caller). Goalie
+\texttt{build\_xy\_for()} computes $\text{weight} = \min(\text{GP}, 40) / 40$, down-weighting
+1--5 start backups — who contribute mostly noise — relative to full-season starters. The weight
+affects only the estimator's \texttt{.fit()} call (passed as \texttt{sample\_weight} into
+\texttt{GridSearchCV}/\texttt{RandomizedSearchCV.fit()}); \texttt{SelectKBest} feature selection
+and all reported test/OOS metrics remain unweighted, so they stay comparable across the change.
+
+\textbf{Joint GAA/save\% candidate.} GAA and save\% are algebraically linked ($r = -0.84$), so a
+\texttt{sklearn.linear\_model.MultiTaskElasticNetCV} fit jointly on both targets — enforcing
+shared feature sparsity — is tried as an additional per-target candidate alongside the
+single-task zoo (Table~\ref{tab:zoo}). It is fit on the full engineered feature set (no
+\texttt{SelectKBest} pre-filter, since the joint L1 penalty already selects features, and
+pre-filtering by each target's marginal correlation could drop a feature useful only jointly)
+and, unlike the single-task models, trains \emph{unweighted} — \texttt{MultiTaskElasticNet} does
+not accept \texttt{sample\_weight}. Each of the two output columns is wrapped in a thin proxy
+estimator exposing a normal \texttt{predict()}/\texttt{coef\_} interface, so it can be persisted
+and consumed as an ordinary single-target model; whichever candidate — single-task or joint —
+wins by Equation~\ref{eq:selection_score} is kept, independently per target.
+
 \subsection{Model persistence}
 
 The winning model for each target is saved to \texttt{models/<target>.joblib} via
@@ -545,7 +580,9 @@ target in the pipeline. Points are moderately persistent: elite forwards remain 
 \textbf{Targets:}
 \begin{itemize}[leftmargin=*]
   \item \texttt{points\_per\_game} (goal + assists per game) — same construct as forwards.
-  \item \texttt{plus\_minus\_per\_game} — net goal differential while on ice per game.
+  \item \texttt{plus\_minus\_residual\_per\_game} = \texttt{plus\_minus\_per\_game} $-$
+        \texttt{points\_per\_game} (2026-08-25, was raw \texttt{plus\_minus\_per\_game}) — see
+        "Joint D-men model" below.
 \end{itemize}
 
 \textbf{Algorithms:} All five for both targets.
@@ -561,10 +598,23 @@ elite-team indicator).
 
 \textbf{Prediction blending:} Both defense targets are blended post-prediction with 2-year
 historical per-game averages to correct for model compression at the extremes of the
-distribution (Section~\ref{sec:blending}).
+distribution (Section~\ref{sec:blending}). \texttt{pool\_ranking.py} reconstructs the full
+plus\_minus prediction (residual model's output $+$ the points model's output) before this blend.
 
 \textbf{OOS performance:} points/game $R^2 \approx 0.4$, concordance $\approx 0.72$;
-plus\_minus/game $R^2 = 0.031$, concordance $\approx 0.54$.
+plus\_minus/game (residual target) $R^2 = 0.145$, concordance $\approx 0.64$ (was $R^2=0.031$,
+concordance $\approx 0.54$ for the raw target — see "Joint D-men model" below).
+
+\textbf{Joint D-men model (2026-08-25).} A defenseman's own goal or assist is both a personal
+point and an on-ice goal-for event, so raw \texttt{plus\_minus\_per\_game} conflates a player's
+own offense with the defensive/team-context signal the model is meant to isolate. Modeling the
+\emph{residual} after removing the points contribution
+($\texttt{plus\_minus\_residual\_per\_game} = \texttt{plus\_minus\_per\_game} -
+\texttt{points\_per\_game}$) as the target — reconstructing the full prediction at inference time
+— slots into the existing single-target harness unchanged (lagged/historical points features
+were already legitimate, non-leaking inputs to the plus\_minus model). This is an approximation,
+not an exact accounting identity: NHL plus/minus excludes power-play goals, which points does
+not.
 
 \subsection{Goalies}
 \label{sec:goalies}
@@ -604,11 +654,20 @@ time (bonus eligibility), not at training time.
   \item Career averages for all rate stats including \texttt{eb\_save\_pct} and \texttt{gsax}.
 \end{itemize}
 
+\textbf{Observation weighting and joint GAA/save\% model (2026-08-25).} See
+Section~\ref{sec:weighting} for the general mechanism. GP-based observation weighting alone
+meaningfully improved GAA (OOS $R^2$ $-0.203 \to -0.062$, concordance now $\approx 0.53$) but
+left save\% a degenerate constant predictor (rank metrics undefined). A joint
+\texttt{MultiTaskElasticNetCV} candidate over (GAA, save\%) was tried next and won for save\%
+(test $R^2$ $-0.221 \to -0.046$, now beats the baseline; OOS $R^2$ $-0.406 \to -0.185$;
+concordance $\approx 0.52$, was undefined); GAA kept its single-task, weighted model, which
+already won there.
+
 \textbf{OOS performance:} wins/game $R^2 \approx 0.10$; shutouts/game $R^2 \approx 0.05$;
-GAA $R^2 = -0.203$; save\% $R^2 = -0.839$. The negative $R^2$ for precision stats is expected
-given near-zero autocorrelation — this is a fundamental data property, not a model failure
-(Thomas 2006). The bonus only needs correct argmax/argmin among qualified goalies, so
-concordance $> 0.5$ is the relevant threshold.
+GAA $R^2 = -0.062$ (was $-0.203$); save\% $R^2 = -0.185$ (was $-0.839$; joint model, see above).
+The negative $R^2$ for precision stats is expected given near-zero autocorrelation — this is a
+fundamental data property, not a model failure (Thomas 2006). The bonus only needs correct
+argmax/argmin among qualified goalies, so concordance $> 0.5$ is the relevant threshold.
 
 
 % ===========================================================================
@@ -661,12 +720,20 @@ Applied values for the 2026-27 season:
 Target & OOS Concordance & $\alpha$ & Interpretation \\
 \midrule
 \texttt{defense\_points}      & $\approx 0.72$ & 0.45 & Model trusted; hist corrects compression \\
-\texttt{defense\_plus\_minus} & $\approx 0.54$ & 0.10 & Model barely beats chance; hist dominates \\
+\texttt{defense\_plus\_minus} & $\approx 0.57$ & 0.15 & Weak but real signal; hist dominates \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\textbf{Effect:} Makar moved from \#44 overall $\to$ \#4 overall after blending.
+\textbf{Effect:} Makar moved from \#44 overall $\to$ \#5 overall after blending.
+
+\textbf{Note (2026-08-25):} \texttt{defense\_plus\_minus} concordance here is measured on the
+\emph{reconstructed} prediction (residual model's output $+$ points model's output, joint D-men
+model — Section~\ref{sec:defense}), not the residual target's own OOS concordance ($\approx
+0.64$). The two are different quantities: prediction errors from the independently-fit points
+and residual models compound when summed, so the reconstructed quantity's own fit against actual
+\texttt{plus\_minus\_per\_game} is weaker than the residual target's fit against the residual.
+$\alpha$ is calibrated on the former, since that is what is actually being blended.
 
 
 % ===========================================================================
@@ -741,10 +808,13 @@ $S_i = \min(\hat{y}_i^{\text{so/g}} \times \text{GP}_i^{\text{proj}},\; W_i)$
 (shutouts capped at wins):
 
 \begin{equation}
-  \text{pool\_points}_i^{\text{goalie}} = 1 \cdot (W_i - S_i) + 3 \cdot S_i
+  \text{pool\_points}_i^{\text{goalie}} = 1 \cdot W_i + 3 \cdot S_i
     + 10 \cdot \mathbf{1}[\text{best GAA among qualified}]
     + 10 \cdot \mathbf{1}[\text{best Sv\% among qualified}]
 \end{equation}
+
+The shutout bonus is additive on top of the win point: a shutout win is worth 4 total
+(1 for the win + 3 shutout bonus), not 3.
 
 A goalie is \emph{qualified} for the bonus if $\text{GP}_i^{\text{proj}} \geq 40$.
 The GAA bonus goes to $\arg\min_i \hat{y}_i^{\text{GAA}}$ among qualified goalies;
@@ -809,31 +879,30 @@ Def Points/G      ridge               0.531    0.001     True  0.741  0.869   0.
 \subsection{Model performance}
 
 Table~\ref{tab:results} summarises out-of-sample performance for all seven production models
-as of the first full diagnostic run (2026-07-24). Concordance and Spearman $\rho$ for the OOS
-evaluation were not yet computed for all targets at that run; estimated ranges are given where
-exact values are unavailable.
+as of the 2026-08-25 model-fit pass (observation weighting, the joint GAA/save\% candidate, and
+the joint D-men residual model — Sections~\ref{sec:weighting}, \ref{sec:defense},
+\ref{sec:goalies}), exact values from \texttt{model\_metrics.csv}.
 
 \begin{table}[h]
 \centering
-\caption{OOS model performance — all 7 targets (2026-07-24)}
+\caption{OOS model performance — all 7 targets (2026-08-25)}
 \label{tab:results}
 \begin{tabular}{L{3.2cm} C{2.4cm} C{1.5cm} C{1.5cm} C{1.8cm} l}
 \toprule
 Target & Algorithm & OOS $R^2$ & OOS Conc. & OOS Spear. $\rho$ & Notes \\
 \midrule
-Fwd Points/G      & Gradient Boosting & 0.665 & $\approx 0.90$ & $\approx 0.83$ & Healthy \\
-Def Points/G      & Ridge / GBM       & $\approx 0.40$ & $\approx 0.72$ & $\approx 0.71$ & Post-blend \\
-Def +/$-$/G       & ElasticNet        & 0.031 & $\approx 0.54$ & $\approx 0.10$ & Near-chance; hist dominates \\
-Goalie Wins/G     & Ridge             & $\approx 0.10$ & $\approx 0.60$ & $\approx 0.35$ & Team-driven \\
-Goalie SO/G       & Ridge             & $\approx 0.05$ & $\approx 0.55$ & $\approx 0.20$ & Rare event \\
-Goalie GAA        & Ridge             & $-0.203$       & $\approx 0.52$ & $\approx 0.10$ & Below mean; expected \\
-Goalie Sv\%       & Lasso             & $-0.839$       & $\approx 0.51$ & $\approx 0.05$ & Below mean; EB helps \\
+Fwd Points/G      & Gradient Boosting & 0.665  & 0.775 & 0.724 & Healthy \\
+Def Points/G      & Gradient Boosting & 0.396  & 0.723 & 0.596 & Post-blend \\
+Def +/$-$/G       & Ridge (resid.)    & 0.145  & 0.642 & 0.402 & Joint D-men model \\
+Goalie Wins/G     & Ridge             & 0.015  & 0.548 & 0.156 & Team-driven \\
+Goalie SO/G       & Lasso             & $-0.139$ & — & — & Rare event; constant predictor \\
+Goalie GAA        & Lasso             & $-0.062$ & 0.533 & 0.104 & Weighted; below mean, expected \\
+Goalie Sv\%       & MultiTask ElasticNet & $-0.185$ & 0.508 & 0.027 & Joint w/ GAA \\
 \bottomrule
-\multicolumn{6}{l}{\small Concordance and Spearman $\rho$ values marked $\approx$ are estimates; exact values in model\_metrics.csv.}
 \end{tabular}
 \end{table}
 
-\subsection{Top-10 overall ranking (2026-07-24)}
+\subsection{Top-10 overall ranking (2026-08-25)}
 
 \begin{center}
 \begin{tabular}{rll}
@@ -843,8 +912,8 @@ Overall Rank & Player & Position \\
 1  & N.\ MacKinnon  & F \\
 2  & N.\ Kucherov   & F \\
 3  & C.\ McDavid    & F \\
-4  & C.\ Makar      & D \\
-5  & L.\ Draisaitl  & F \\
+4  & L.\ Draisaitl  & F \\
+5  & C.\ Makar      & D \\
 6  & D.\ Pastrnak   & F \\
 7  & E.\ Bouchard   & D \\
 8  & N.\ Suzuki     & F \\
@@ -854,7 +923,234 @@ Overall Rank & Player & Position \\
 \end{tabular}
 \end{center}
 
-Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked \#44.
+Cale Makar at \#5 reflects the defense blending fix; prior to blending he ranked \#44.
+
+
+% ===========================================================================
+\section{Draft Position-Order Strategy}
+\label{sec:draftstrategy}
+% ===========================================================================
+
+The player-ranking pipeline above answers \emph{which players} are most valuable. It says
+nothing about \emph{in what order to draft positions} during the live 9-team snake draft, given
+that the best player at a chosen position is assumed to be taken and that other teams' picks are
+unpredictable. This section documents \texttt{draft\_strategy.py} and the \texttt{common/draft/}
+package, added 2026-08-24, which answers that question directly. It is a positional (not
+player-level) strategy tool: it never tracks or recommends specific players, and is explicitly
+scoped separately from the still-unbuilt live, player-tracking draft-day assistant (Future Work).
+
+\subsection{Pool structure}
+
+\begin{table}[h]
+\centering
+\caption{9-team pool roster structure}
+\label{tab:draftroster}
+\begin{tabular}{lrrr}
+\toprule
+ & Starters & Bench/IR & Total per team \\
+\midrule
+Forward & 7 & 3 & 10 \\
+Defense & 3 & 2 & 5 \\
+Goalie  & 1 & 1 & 2 \\
+\midrule
+\multicolumn{4}{l}{League-wide (9 teams): 90 forwards, 45 defensemen, 18 goalies drafted, 17 rounds.} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Bench/IR slots are substitutable into the active lineup up to twice a week (unlimited for
+injuries) — generous enough that every drafted player is treated as contributing full value, so
+"cap" above is starters + bench combined rather than starters alone. The draft order is a single
+random ordering fixed before the draft and reversed each round (standard snake).
+
+\subsection{Historical value curves}
+
+Rather than relying on a single season (either an actual-results season or the current
+projections alone), a value curve per position is built from \textbf{18 real NHL seasons,
+2008-09 through 2025-26}, scored under the pool's own rules via
+\texttt{compute\_pool\_points()} (Section~\ref{sec:scoring}) reused unchanged — only the input
+columns are adapted, mapping each historical season's actual stats onto the
+\texttt{pred\_*}/\texttt{projected\_games} names that function expects.
+
+\textbf{Season-length normalization.} Three seasons were not 82 games: 2012-13 (lockout, 48
+games), 2019-20 (COVID suspension, $\approx$70 games league-wide average), and 2020-21 (COVID,
+56 games). Counting stats are rate-converted and rescaled to an 82-game-equivalent pace:
+
+\begin{equation}
+  \text{GP}^{\text{norm}}_{i,s} = 82 \times \frac{\text{GP}_{i,s}}{L_s}, \qquad
+  L_s = \begin{cases} 48 & s = \text{2012-13} \\ 70 & s = \text{2019-20} \\
+                       56 & s = \text{2020-21} \\ 82 & \text{otherwise} \end{cases}
+\end{equation}
+
+Using $\text{GP}^{\text{norm}}$ as \emph{both} the pace-scaling factor and the goalie
+bonus-qualification threshold (rather than raw $\text{GP}_{i,s}$) has a second effect: a goalie
+who played all 48 games of the 2012-13 lockout season is correctly treated as having played a
+"full" season, not penalized against the fixed 40-game bar meant for an 82-game season.
+
+For each season, players are ranked within position by pool\_points; the final curve is the
+equal-weighted average pool\_points at each rank across all seasons with a player at that rank —
+the same "trust the multi-year pattern over any one year" principle already used elsewhere in
+the pipeline (2-3 year lag averaging in \texttt{common/features/engineering.py}, the 3-year GP
+window in \texttt{pool\_ranking.\_projected\_games()}), applied here across the full 18-year
+history to build a stable scarcity curve rather than a short-term trend.
+
+\textbf{Plausibility cross-check:} the historical curve's shape (each rank's value normalized to
+a fraction of the \#1 player's value) is correlated against the current 2026-27 projected
+ranking's shape. A plain rank-vs-rank (Spearman) correlation would be trivially 1.0 for any two
+monotonically-decreasing curves regardless of whether their actual shapes agree, so a Pearson
+correlation on the normalized values is used instead:
+
+\begin{table}[h]
+\centering
+\caption{Historical value-curve vs.\ current-season projection shape agreement}
+\label{tab:crosscheck}
+\begin{tabular}{lr}
+\toprule
+Position & Normalized-shape Pearson $r$ \\
+\midrule
+Forward & 1.00 \\
+Defense & 1.00 \\
+Goalie  & 0.93 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Scarcity: two distinct signals}
+
+\begin{table}[h]
+\centering
+\caption{Positional scarcity, 18-season aggregated curves (2026-08-25)}
+\label{tab:scarcity}
+\begin{tabular}{l C{1.4cm} L{4.3cm} L{3.6cm} L{3.2cm}}
+\toprule
+Position & \#1 value & Range drop (\#1$\to$last drafted) & Cliff (15 spots beyond) & Verdict \\
+\midrule
+Forward & 118.6 & 56\% (to \#90: 51.7) & 7\% (\#105: 48.2) & Safe to defer \\
+Defense & 100.9 & 61\% (to \#45: 39.7) & 17\% (\#60: 33.2) & Steep, but a fallback exists \\
+Goalie  & 72.7  & 51\% (to \#18: 35.3) & \textbf{36\%} (\#33: 22.4) & \textbf{Don't wait} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \emph{range drop} (\#1 to the last player the league will draft at that position) measures
+overall depth; the \emph{cliff} (last drafted vs.\ 15 spots further down) measures the real
+draft-day risk of waiting one round too long. Defense has the steepest range drop, but forwards
+and defense both still have a reasonable fallback tier just past their cutoffs. Goalies are the
+clear outlier: only a 51\% range drop, but a further 36\% collapse in the 15 picks past \#18 —
+missing the goalie window is expensive, which matches standard hockey-pool intuition (shallow
+starter-caliber goalie pool) even though the raw range-drop numbers alone would not have shown it.
+
+\subsection{Draft simulation and strategy comparison}
+
+Opponents (8 other teams) are modeled per the simplification confirmed for this tool: at each
+pick, a team chooses among its still-open positions via a softmax over each eligible position's
+current top-of-curve value (temperature $\tau=1.5$ by default), approximating "best player
+available among remaining needs" without deeper per-team modeling. The user's own picks are
+generated by one of three candidate policies, compared via $M=1500$ Monte Carlo drafts per
+policy per draft slot:
+
+\begin{description}[leftmargin=3cm, style=nextline]
+  \item[\texttt{value\_greedy}] Always take the eligible position with the highest current
+        top-of-curve value (naive best-player-available, position-blind beyond eligibility).
+  \item[\texttt{balanced\_need}] Take the eligible position furthest below its final roster
+        target fraction (10F:5D:2G) — even pacing across the draft.
+  \item[\texttt{urgency\_greedy}] VONA-style: take the position with the largest estimated value
+        erosion by the user's own next pick, where the expected number of that position taken by
+        opponents in the interim is estimated from its share of remaining league-wide need.
+\end{description}
+
+\begin{table}[h]
+\centering
+\caption{Best-performing policy by draft slot (avg.\ simulated team pool\_points total)}
+\label{tab:policywinner}
+\begin{tabular}{crrrl}
+\toprule
+Slot & value\_greedy & balanced\_need & urgency\_greedy & Winner \\
+\midrule
+1 & 1076.3 & 1083.8 & \textbf{1084.0} & urgency\_greedy \\
+2 & 1065.2 & \textbf{1074.0} & 1071.5 & balanced\_need \\
+3 & 1060.1 & \textbf{1070.3} & 1068.6 & balanced\_need \\
+4 & 1060.4 & 1067.8 & \textbf{1068.1} & urgency\_greedy \\
+5 & 1058.0 & \textbf{1067.4} & 1054.3 & balanced\_need \\
+6 & 1054.7 & \textbf{1066.3} & 1054.5 & balanced\_need \\
+7 & 1051.1 & \textbf{1065.2} & 1053.2 & balanced\_need \\
+8 & 1051.5 & \textbf{1065.0} & 1053.3 & balanced\_need \\
+9 & 1052.3 & \textbf{1067.0} & 1065.5 & balanced\_need \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Result: \texttt{balanced\_need} wins 7 of the 9 draft slots}, with \texttt{urgency\_greedy}
+narrowly ahead at slots 1 and 4 — by 0.2 and 0.3 points respectively, out of $\sim$1070-1080
+total (well under 0.1\%), i.e.\ a practical statistical tie at those two slots rather than a
+robust preference. (Re-scoring goalie shutouts as additive, Section~\ref{sec:scoring}, raised
+goalie value enough to flip these two slots from the prior run; the other 7 are unaffected and
+still decisive.) Evenly pacing forward/defense/goalie picks against their final roster targets
+throughout the draft outperformed both chasing raw best-available value (\texttt{value\_greedy},
+which loads up on forwards early since their absolute values are highest, then scrambles for
+defense and goalies late) and pure scarcity-chasing (\texttt{urgency\_greedy}, which front-loads
+defense/goalie but can overcorrect) at 7 of 9 slots, and is essentially tied with scarcity-chasing
+at the other 2. \texttt{balanced\_need} remains the recommended default for this pool given its
+consistency and its deterministic, easy-to-follow recommendations (see below).
+
+\subsection{Recommended ordering example (draft slot 5)}
+
+Table~\ref{tab:slot5} shows \texttt{balanced\_need}'s round-by-round recommendation for draft
+slot 5 (the same table is generated for all 9 slots in \texttt{results/draft/round\_priority\_
+slot\_<1-9>.csv}) — slot 5 is used here rather than slot 4 because \texttt{balanced\_need} only
+narrowly (and non-robustly, see Table~\ref{tab:policywinner}) wins slot 4, while it decisively
+wins slot 5. Because \texttt{balanced\_need} depends only on the user's own roster fill state,
+not on opponents' choices, its recommendation is deterministic (100\% confidence) at every round
+for a given slot — unlike \texttt{urgency\_greedy}, which estimates opponent behavior and is
+occasionally less than 100\% confident in its own recommendation.
+
+\begin{table}[h]
+\centering
+\caption{Recommended draft order — slot 5 (balanced\_need policy)}
+\label{tab:slot5}
+\begin{tabular}{rrl}
+\toprule
+Round & Overall pick & Recommended position \\
+\midrule
+1  & 5   & Forward \\
+2  & 14  & Defense \\
+3  & 23  & Goalie \\
+4  & 32  & Forward \\
+5  & 41  & Forward \\
+6  & 50  & Defense \\
+7  & 59  & Forward \\
+8  & 68  & Forward \\
+9  & 77  & Defense \\
+10 & 86  & Forward \\
+11 & 95  & Goalie \\
+12 & 104 & Forward \\
+13 & 113 & Defense \\
+14 & 122 & Forward \\
+15 & 131 & Forward \\
+16 & 140 & Defense \\
+17 & 149 & Forward \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The pattern generalizes across slots: secure a goalie early (well before the \#18 cutoff, given
+the 36\% post-cutoff cliff), interleave defense roughly every 2-3 forward picks rather than
+saving it for a dedicated run, and let forwards — the deepest, most cushioned position — fill
+the remaining picks as they come up.
+
+\subsection{Usage and outputs}
+
+\begin{lstlisting}[language=bash]
+python3 draft_strategy.py --season 2026-27               # all 9 slots
+python3 draft_strategy.py --season 2026-27 --my-slot 5    # + slot-5 table path printed
+\end{lstlisting}
+
+Writes to \texttt{results/draft/}: \texttt{value\_curves.csv} (full F/D/G curves),
+\texttt{policy\_comparison.csv} (all slots $\times$ policies), \texttt{round\_priority\_slot\_
+<1-9>.csv} (one per slot), and \texttt{draft\_strategy\_report.txt} (the summary printed above).
+No changes were made to \texttt{run\_season.py}, \texttt{pool\_ranking.py}, or the scrape/clean/
+train/predict pipeline — this tool only reads the raw historical CSVs and the current rankings
+file already produced by that pipeline.
 
 
 % ===========================================================================
@@ -874,11 +1170,17 @@ Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked
         goalies, which is a weaker requirement than accurate regression.
 
   \item[Defense plus/minus]
-        OOS $R^2 = 0.031$ and concordance $\approx 0.54$. The model barely beats the
-        chance baseline. This stat is highly dependent on team context (a plus/minus changes
-        by $\pm 1$ whether or not the goalie saves a shot that would not be attributed to any
-        on-ice skater). Prediction blending (alpha = 0.10 toward historical averages) partially
-        corrects the ranking.
+        Modeled as a residual after removing the points contribution (2026-08-25): the residual
+        target's own OOS $R^2$ improved from $0.031$ to $0.145$ and concordance from
+        $\approx 0.54$ to $\approx 0.64$. Still a comparatively weak signal — this stat is
+        highly dependent on team context (a plus/minus changes by $\pm 1$ whether or not the
+        goalie saves a shot that would not be attributed to any on-ice skater) — and the
+        residual formulation is an approximation, not an exact accounting identity (NHL
+        plus/minus excludes power-play goals, points doesn't). Prediction blending (alpha
+        recalibrated to 0.15, Section~\ref{sec:blending}) applies to the \emph{reconstructed}
+        (residual + points) prediction, whose own OOS concordance ($\approx 0.57$) is lower than
+        the residual target's ($\approx 0.64$) — the two independently-fit models' errors
+        compound when summed.
 
   \item[Traded players — historical team context]
         Players who changed teams during a historical season are assigned the \emph{first}
@@ -893,15 +1195,18 @@ Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked
         very few games played who are genuinely absent from MoneyPuck's records, not join
         failures. They receive NaN for all MoneyPuck features, which become 0 after imputation.
 
-  \item[Observation weighting not implemented]
-        All training rows carry equal weight regardless of the player's game count. A backup
-        goalie with 3 starts influences the loss function equally to a starter with 60. Planned
-        fix: \texttt{sample\_weight = min(GP, 40) / 40} via optional threading in
-        \texttt{training.py} (see Future Work).
-
   \item[Pool scoring rules constant year-to-year]
         No time-varying config is needed; the rules have not changed. Any future rule change
         requires only a config edit.
+
+  \item[Draft strategy: unvalidated modeling choices]
+        Section~\ref{sec:draftstrategy}'s season-length normalization (82-game-pace rescaling)
+        and opponent policy (softmax over eligible-position top value, $\tau=1.5$) are reasonable
+        but new assumptions with no prior art in this codebase and no historical draft-pick data
+        to calibrate against. The \texttt{urgency\_greedy} policy's expected-picks-at-position
+        estimate is a share-of-remaining-need approximation, not an exact computation. Logging
+        this season's actual draft (once the deferred live tool exists) would enable empirical
+        calibration in future seasons.
 
 \end{description}
 
@@ -913,6 +1218,16 @@ Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked
 
 \begin{description}[leftmargin=3cm, style=nextline]
 
+  \item[Done, 2026-08-25: observation weighting, joint GAA/save\% model, joint D-men model]
+        Three items previously listed here are now implemented — see the Modeling Framework
+        (Section~\ref{sec:modeling}) and Position-Specific Models (Section~\ref{sec:positions})
+        sections, and \texttt{PROJECT.md}'s 2026-08-25 changelog entry for full detail and
+        before/after metrics: goalie observation weighting
+        ($\texttt{sample\_weight} = \texttt{min(GP, 40) / 40}$, threaded through the shared
+        training harness), a \texttt{MultiTaskElasticNetCV} joint (GAA, save\%) candidate (kept
+        only for save\%, where it beat the single-task model), and the joint D-men model
+        (plus\_minus modeled as a residual after removing the points contribution).
+
   \item[GP diagnostic Layer 2: game-log debut date]
         The current partial-season filter (GP $<$ 25) works on the aggregate season count. A
         richer signal is already available: \texttt{nhl\_game\_logs.csv} contains
@@ -923,37 +1238,19 @@ Cale Makar at \#4 reflects the defense blending fix; prior to blending he ranked
         October injury (first game in November). Deferred because the threshold filter handles
         the known cases; implement if edge cases emerge.
 
-  \item[Observation weighting]
-        Thread \texttt{sample\_weight} through \texttt{\_fit\_one()},
-        \texttt{train\_and\_select()}, and \texttt{train\_all\_vs\_exclude\_latest()} in
-        \texttt{training.py} as an optional parameter (default None = current behavior).
-        In goalie \texttt{build\_xy\_for()}, compute weights as
-        $\texttt{min(GP, 40) / 40}$ and return as a 4th element. This down-weights 1--5 start
-        goalies who contribute mostly noise to the fit.
-
-  \item[MultiTaskElasticNet for (GAA, save\%)]
-        Train a single \texttt{sklearn.linear\_model.MultiTaskElasticNetCV} on the
-        $[GAA, \text{save\%}]$ pair to enforce joint feature sparsity: a feature is either
-        selected for both targets or neither. The algebraic linkage ($r = -0.84$) means both
-        targets should share most of their predictive signal. Only implement if observation
-        weighting alone is insufficient.
-
-  \item[Joint D-men model]
-        Defenseman goals and assists directly contribute to their plus/minus (a scored goal
-        counted in points is also counted as $+1$). Predicting plus\_minus as a residual after
-        removing the points contribution would isolate the defensive-zone and special-teams
-        components. Alternatively, a multi-output regression joint over (points, plus\_minus)
-        could be explored.
-
   \item[Majority-team for historical traded players]
         Expand per-game log collection from the current season only to all historical seasons
         (one API call per player per season for $\sim$18 years). Assign each player to the
         team they played the most games for. This would make the team-context lag features
         more accurate for the $\sim$5--10\% of historical rows involving mid-season trades.
 
-  \item[Interactive draft-day tool]
-        A live tool for draft day: show remaining available players ranked by pool points,
-        allow filtering by position, mark picked players. Lowest priority; nothing built yet.
+  \item[Interactive draft-day tool (player-level, live)]
+        The \emph{position-order} strategy piece is now built (Section~\ref{sec:draftstrategy},
+        \texttt{draft\_strategy.py}). What remains is the live, player-level assistant: show
+        remaining available players ranked by pool points during the actual draft, allow
+        filtering by position, mark picked players as they come off the board, and recompute
+        recommendations in real time. Deliberately deferred and scoped separately — the
+        position-order tool above is intentionally player-identity-free.
 
   \item[2027-28 season]
         Copy \texttt{2026-27/config.yaml} $\to$ \texttt{2027-28/config.yaml}, update

@@ -5,6 +5,15 @@ team context for plus/minus, but those features are NaN→0 at prediction time (
 not played yet), causing a systematic train/predict mismatch. Career averages for plus_minus
 are added instead (more stable signal than any single-year lag given autocorr r≈0.279).
 
+The plus_minus target is modeled as a residual after removing a defenseman's own points
+contribution (plus_minus_per_game - points_per_game), rather than raw plus_minus_per_game
+directly: a defenseman's own goal/assist is both a personal point and an on-ice goal-for event,
+so points and plus/minus are not independent signals. This is an approximation, not an exact
+accounting identity — NHL plus/minus excludes power-play goals, which points does not — but it
+isolates the defensive/team-context component the raw target otherwise conflates with a player's
+own offense. pool_ranking.py reconstructs the full plus_minus prediction by adding this
+residual's prediction back to the points model's prediction before blending/scoring.
+
 Pool scoring for defense is goals + assists + net plus/minus.
 """
 
@@ -16,9 +25,9 @@ from common.config import SeasonConfig
 from common.features import engineering as fe
 from common.models import training as tr
 
-TARGETS = {"points": "points_per_game", "plus_minus": "plus_minus_per_game"}
-_TARGET_COLS = ["points_per_game", "plus_minus_per_game", "points_player", "total_points",
-                "plus_minus", "total_plus_minus"]
+TARGETS = {"points": "points_per_game", "plus_minus_residual": "plus_minus_residual_per_game"}
+_TARGET_COLS = ["points_per_game", "plus_minus_per_game", "plus_minus_residual_per_game",
+                "points_player", "total_points", "plus_minus", "total_plus_minus"]
 
 _INDIVIDUAL = ["goals", "assists", "shots", "games_played_player", "shooting_pct",
                "time_on_ice_per_game", "points_player", "points_per_game", "plus_minus",
@@ -51,6 +60,7 @@ def engineer(df: pd.DataFrame, cfg: SeasonConfig) -> pd.DataFrame:
     df["total_points"] = pd.to_numeric(df["points_player"], errors="coerce").fillna(0)
     df["total_plus_minus"] = pd.to_numeric(df["plus_minus"], errors="coerce").fillna(0)
     df = fe.per_game_target(df, "total_plus_minus", "plus_minus_per_game")
+    df["plus_minus_residual_per_game"] = df["plus_minus_per_game"] - df["points_per_game"]
     df = fe.add_covid_indicators(df)
     df = fe.add_years_played(df, prime_range=(3, 12))  # D peak later than forwards
     df = fe.add_team_goal_differential(df)
